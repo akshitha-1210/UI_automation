@@ -1,89 +1,57 @@
 import { test } from '@playwright/test';
-import fs from 'fs';
 
 const USER_EMAIL = 'user2@yopmail.com';
 const USER_PASSWORD = 'User2@123';
 
+// Direct Keycloak OIDC login URL — navigating here always shows the login form reliably.
+const LOGIN_URL =
+  'https://sandbox.sunbirded.org/auth/realms/sunbird/protocol/openid-connect/auth' +
+  '?client_id=portal&state=7e84b3bd-ecd0-488e-82ec-ca3e476234ac' +
+  '&redirect_uri=https%3A%2F%2Fsandbox.sunbirded.org%2Fresources%3Fauth_callback%3D1' +
+  '&scope=openid&response_type=code&version=4';
+
 test('save auth storageState', async ({ browser }) => {
-  // Create a fresh context and page to perform login and persist storage state
+  test.setTimeout(60_000);
+
+  // Create a fresh context (no stored state) so we always get the login form
   const context = await browser.newContext();
   const page = await context.newPage();
 
-  // Navigate to the site - we'll try to open the login form and sign in
-  await page.goto('https://sandbox.sunbirded.org', { waitUntil: 'load' });
+  console.log('Navigating directly to Keycloak login page...');
+  await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30000 });
 
-  // Try to open a login form via profile/login buttons
-  try {
-    const profileBtn = page.getByRole('button', { name: /Profile|Login|Sign in|Sign In|Sign in/i }).first();
-    if (await profileBtn.count() > 0) {
-      await profileBtn.click().catch(() => { });
-    } else {
-      const loginLink = page.getByRole('link', { name: /Login|Sign in|Sign In|Sign in/i }).first();
-      if (await loginLink.count() > 0) await loginLink.click().catch(() => { });
-    }
-  } catch (e) {
-    // best-effort, continue
+  // The Keycloak login page should show username + password fields
+  const usernameField = page.locator('#username, input[name="username"], input[type="email"]').first();
+  await usernameField.waitFor({ state: 'visible', timeout: 15000 });
+
+  console.log('Filling credentials...');
+  await usernameField.fill(USER_EMAIL);
+
+  const passwordField = page.locator('#password, input[name="password"], input[type="password"]').first();
+  await passwordField.waitFor({ state: 'visible', timeout: 10000 });
+  await passwordField.fill(USER_PASSWORD);
+
+  console.log('Submitting login form...');
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => { }),
+    page.locator('button[type="submit"], input[type="submit"], button:has-text("Log In"), button:has-text("Login"), button:has-text("Sign In")').first().click(),
+  ]);
+
+  // Verify we landed back on the portal (the redirect_uri after successful auth)
+  const currentUrl = page.url();
+  console.log('Post-login URL:', currentUrl);
+
+  if (currentUrl.includes('/auth/realms/')) {
+    throw new Error(`Login failed — still on Keycloak page. Check credentials. URL: ${currentUrl}`);
   }
 
-  // Wait for email input to appear; if not, attempt to open a known login URL
-  const email = page.locator('input[type="email"], input[name="username"], input[name="email"], input[placeholder*="Email"], input[aria-label*="Email"]').first();
-  try {
-    await email.waitFor({ state: 'visible', timeout: 5000 });
-  } catch {
-    // try clicking a prominent sign-in button to reveal the form
-    const signIn = page.getByRole('button', { name: /Login|Log in|Sign in|Sign In/i }).first();
-    if (await signIn.count() > 0) await signIn.click().catch(() => { });
-    try { await email.waitFor({ state: 'visible', timeout: 5000 }); } catch { }
-  }
-
-  if (await email.count() > 0) {
-    await email.fill(USER_EMAIL).catch(() => { });
-    const pass = page.locator('input[type="password"], input[name="password"], input[placeholder*="Password"]').first();
-    if (await pass.count() > 0) await pass.fill(USER_PASSWORD).catch(() => { });
-    const submit = page.locator('button:has-text("Login"), button:has-text("Log in"), button:has-text("Sign in"), button[type="submit"]').first();
-    if (await submit.count() > 0) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => { }),
-        submit.click().catch(() => { }),
-      ]);
-    }
-  } else {
-    // Fallback: go directly to a /login path (best-effort)
-    await page.goto('https://sandbox.sunbirded.org/auth/realms/sunbird/protocol/openid-connect/auth?client_id=portal&state=8009fa52-ade1-435f-bd1d-f8cd084e3e83&redirect_uri=https%3A%2F%2Fsandbox.sunbirded.org%2Fresources%3Fauth_callback%3D1&scope=openid&response_type=code&version=4', { waitUntil: 'load' }).catch(() => { });
-    const email2 = page.locator('input[type="email"]').first();
-    if (await email2.count() > 0) {
-      await email2.fill(USER_EMAIL).catch(() => { });
-      const pass2 = page.locator('input[type="password"]').first();
-      if (await pass2.count() > 0) await pass2.fill(USER_PASSWORD).catch(() => { });
-      const submit2 = page.locator('button[type="submit"]').first();
-      if (await submit2.count() > 0) {
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => { }),
-          submit2.click().catch(() => { }),
-        ]);
-      }
-    }
-  }
-
-  // After login attempt, wait for a clear authenticated indicator.
-  // Prefer an element that's only visible to logged-in users (profile / learner passbook / sign out)
-  const authIndicator = page.locator('button[aria-label*="profile"i], text=My Profile, text=Profile, text=Learner passbook, text=Sign out').first();
-  try {
-    await authIndicator.waitFor({ state: 'visible', timeout: 15000 });
-  } catch (err) {
-    // Not found — as a fallback check cookies for a session cookie
-    const cookies = await context.cookies();
-    const hasSession = cookies.some(c => /connect.sid|AUTH_SESSION_ID|KC_RESTART/.test(c.name));
-    if (!hasSession) {
-      console.error('Login did not complete: no profile element and no session cookie found. Cookies:', cookies.map(c => ({ name: c.name, domain: c.domain })));
-      await context.close();
-      throw new Error('Failed to sign in - see logs for details');
-    }
-  }
+  // Wait for the portal to fully settle after callback
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => { });
 
   // Persist storage state to a file that other tests can consume
   await context.storageState({ path: 'auth.json' });
-  console.log('Saved auth storageState to auth.json — please re-run course tests to use it.');
+  console.log('✅ Saved auth storageState to auth.json — re-run course tests to use it.');
 
   await context.close();
 });
+

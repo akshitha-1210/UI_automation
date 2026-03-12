@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { handleServerErrors } from './helpers';
+import { handleServerErrors, setupAutoDismiss } from './helpers';
 
 test.use({ storageState: 'tests/user_consumption/auth.json' });
 
@@ -7,6 +7,9 @@ const START_URL = 'https://sandbox.sunbirded.org/resources?board=CBSE&medium=Eng
 
 test('Test 2: Join Course', async ({ page }) => {
   test.setTimeout(8 * 60 * 1000);
+
+  // Register autonomous popup/modal/banner dismissal handlers
+  await setupAutoDismiss(page);
 
   console.log('Navigating to portal...');
   await page.goto(START_URL, { waitUntil: 'load', timeout: 90000 }).catch(() => { });

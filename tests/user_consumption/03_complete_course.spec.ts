@@ -1,11 +1,15 @@
 import { test, expect } from '@playwright/test';
-import { handleServerErrors } from './helpers';
+import { handleServerErrors, handleLogin, setupAutoDismiss, setupBugDetector, takeCheckpoint, runUIHealthChecks } from './helpers';
 
 test.use({ storageState: 'tests/user_consumption/auth.json' });
 
-test('Test 3: Complete Course', async ({ page }) => {
+test('Test 3: Complete Course', async ({ page, context }, testInfo) => {
   test.setTimeout(15 * 60 * 1000); // 15 minutes for full consumption
   console.log('Starting course consumption flow...');
+
+  // ── Setup autonomous helpers ──────────────────────────────────────────────
+  await setupAutoDismiss(page);                     // auto-dismiss popups
+  const bugs = setupBugDetector(page);              // monitor console/network bugs
 
   const COURSE_LIST_URL = 'https://sandbox.sunbirded.org/resources?board=CBSE&medium=English&gradeLevel=Class%201&subject=English&id=NCF&selectedTab=course';
 
@@ -13,12 +17,14 @@ test('Test 3: Complete Course', async ({ page }) => {
   console.log('Navigating to course search list...');
   await page.goto(COURSE_LIST_URL, { waitUntil: 'load', timeout: 60000 }).catch(() => { });
   await page.waitForLoadState('networkidle').catch(() => { });
+  await takeCheckpoint(page, testInfo, '01-course-list-loaded');  // 📸
 
   // Recovery: If redirected to login, use helper
-  const { handleLogin } = require('./helpers');
   await handleLogin(page);
+  await takeCheckpoint(page, testInfo, '02-after-login');         // 📸
 
   await handleServerErrors(page);
+  await runUIHealthChecks(page);  // 🔍 check page immediately after load
 
   // 2. Find and open an incomplete course
   console.log('Searching for an incomplete course...');
@@ -105,6 +111,7 @@ test('Test 3: Complete Course', async ({ page }) => {
 
     if (canProceed || !isCompleted) {
       console.log(`Success: Found an incomplete course ("${cardTitle.trim()}"). Proceeding to unit consumption...`);
+      await takeCheckpoint(page, testInfo, `03-course-selected-${i + 1}`);  // 📸
       courseOpened = true;
       break;
     }
@@ -112,6 +119,7 @@ test('Test 3: Complete Course', async ({ page }) => {
 
   if (!courseOpened) {
     console.log('Notice: No clearly incomplete courses found in the current search criteria.');
+    await takeCheckpoint(page, testInfo, '03-no-course-found');  // 📸
   }
 
   // 5. Entry to Consumption (Start Learning)
@@ -149,6 +157,9 @@ test('Test 3: Complete Course', async ({ page }) => {
     const playBtn = page.locator('.sb-btn-primary, .sb-btn-outline-primary').filter({ hasText: /learning|play|resume/i }).first();
     if (await playBtn.isVisible().catch(() => false)) await playBtn.click({ force: true }).catch(() => { });
   }
+
+  await takeCheckpoint(page, testInfo, '04-player-view-entered');  // 📸
+  await bugs.checkpointReport(page, 'before-unit-loop');           // 📊
 
   // 6. Unit Consumption Loop
   console.log('--- Starting Unit-by-Unit Consumption ---');
@@ -400,6 +411,7 @@ test('Test 3: Complete Course', async ({ page }) => {
     console.log(`Current progress: ${progressText}`);
     if (progressText.includes('100%') || progressText.includes('Completed')) {
       console.log('Success: Course completed fully.');
+      await takeCheckpoint(page, testInfo, '05-course-100-percent');  // 📸
       break;
     }
 
@@ -495,13 +507,19 @@ test('Test 3: Complete Course', async ({ page }) => {
       console.log('Learner passbook found. Scrolling into view...');
       await passbook.scrollIntoViewIfNeeded().catch(() => { });
       await page.waitForTimeout(5000);
+      await takeCheckpoint(page, testInfo, '06-learner-passbook');    // 📸
       console.log('--- Flow Complete: Course Consumed & Passbook Verified ---');
     } else {
       console.log('Warning: Learner passbook not visible on profile page. Scrolling down anyway...');
       await page.mouse.wheel(0, 1000);
       await page.waitForTimeout(3000);
+      await takeCheckpoint(page, testInfo, '06-profile-page-fallback');  // 📸
     }
   }
+
+  // ── Final bug summary ───────────────────────────────────────────────────
+  const uiIssues = await runUIHealthChecks(page);  // 🔍 final health scan
+  await bugs.checkpointReport(page, 'end-of-test'); // 📊 full bug report
 
   await page.context().storageState({ path: 'tests/user_consumption/auth.json' }).catch(() => { });
   console.log('Test 3: Course consumption and profile verification finished.');
