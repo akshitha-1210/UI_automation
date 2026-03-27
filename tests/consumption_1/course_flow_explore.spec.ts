@@ -55,7 +55,7 @@ async function hasNoBatchesAvailable(page: Page): Promise<boolean> {
   ];
   for (const sel of noBatchSels) {
     if (await page.locator(sel).first().isVisible({ timeout: 1500 }).catch(() => false)) {
-      console.log(`  ⚠️  "No batches available" detected (${sel}) — skipping this course`);
+      console.log(` "No batches available" detected (${sel}) — skipping this course`);
       return true;
     }
   }
@@ -547,6 +547,125 @@ async function clickThreeDotsInProgressCard(page: Page): Promise<boolean> {
   return false;
 }
 
+// ─── helper: leave course via three-dots → "Leave Course" ────────────────────
+// Called when a lesson cannot be completed. Navigates back to the course
+// landing page (if inside a player), opens the ⋮ menu on the Course Progress
+// card, clicks "Leave Course", confirms the dialog, and verifies the
+// unenrolment toast. Every failure step is reported as a bug.
+async function leaveCourseViaThreeDots(page: Page, coursePageUrl: string): Promise<boolean> {
+  console.log('\n  [leave-course] Lesson could not be completed — leaving course via ⋮ menu…');
+
+  // If inside a lesson player, go back to the course landing page first
+  const isInsidePlayer = /\/content\/do_/.test(page.url());
+  if (isInsidePlayer) {
+    const goBackBtn = page.locator(
+      'a:has-text("Go Back"), button:has-text("Go Back"), [aria-label*="back" i], a.back-btn'
+    ).first();
+    if (await goBackBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await goBackBtn.click().catch(() => {});
+    } else {
+      await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    }
+    await page.waitForTimeout(2000);
+  } else if (page.url() !== coursePageUrl) {
+    await page.goto(coursePageUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+
+  // ── Step 1: click ⋮ in the Course Progress card ────────────────────────────
+  const dotsClicked = await clickThreeDotsInProgressCard(page);
+  if (!dotsClicked) {
+    await bugReport(page, 'leave-course-no-threedots',
+      'BUG [leave-course]: Three-dots (⋮) button not found in the Course Progress card — cannot trigger "Leave Course".');
+    return false;
+  }
+  await page.waitForTimeout(600);
+
+  const menuShot = `test-results/leave-course-menu-${Date.now()}.png`;
+  await page.screenshot({ path: menuShot }).catch(() => {});
+  await test.info().attach('leave-course-menu', { path: menuShot, contentType: 'image/png' }).catch(() => {});
+
+  // ── Step 2: click "Leave Course" in the dropdown ───────────────────────────
+  const leaveBtn = page.getByRole('button', { name: /leave course/i })
+    .or(page.getByRole('menuitem', { name: /leave course/i }))
+    .or(page.locator('button').filter({ hasText: /leave course/i }))
+    .first();
+
+  const leaveVisible = await leaveBtn.isVisible({ timeout: 2000 }).catch(() => false);
+  if (!leaveVisible) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await bugReport(page, 'leave-course-option-missing',
+      'BUG [leave-course]: Clicked ⋮ but "Leave Course" option was NOT in the dropdown.\n' +
+      `  Screenshot: ${menuShot}`);
+    return false;
+  }
+
+  console.log('  [leave-course] Clicking "Leave Course"…');
+  await leaveBtn.click().catch(async () => {
+    await leaveBtn.evaluate((el: Element) => (el as HTMLElement).click()).catch(() => {});
+  });
+  await page.waitForTimeout(1200);
+
+  // ── Step 3: confirm the "Batch Unenrolment" dialog ─────────────────────────
+  const dialog = page.locator(
+    '[role="dialog"][aria-label="Batch Unenrolment"], [aria-label="Batch Unenrolment"]'
+  ).first();
+  if (await dialog.isVisible({ timeout: 4000 }).catch(() => false)) {
+    console.log('  [leave-course] Confirmation dialog open — clicking confirm…');
+    const confirmBtn = dialog.getByRole('button', { name: /leave course/i })
+      .or(dialog.locator('button').filter({ hasText: /leave course/i }))
+      .or(dialog.locator('button').filter({ hasText: /yes|confirm|leave/i }))
+      .first();
+    if (await confirmBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await confirmBtn.evaluate((el: Element) => (el as HTMLElement).click()).catch(() => {});
+    } else {
+      await page.evaluate(() => {
+        const dlg = document.querySelector(
+          '[role="dialog"][aria-label="Batch Unenrolment"], [aria-label="Batch Unenrolment"]'
+        );
+        if (!dlg) return;
+        const btns = Array.from(dlg.querySelectorAll('button'));
+        const btn = btns.find(b =>
+          /leave course|yes|confirm|leave/i.test(b.textContent ?? '') &&
+          !/cancel|close|no/i.test(b.textContent ?? '')
+        );
+        if (btn) (btn as HTMLElement).click();
+      }).catch(() => {});
+    }
+    await page.waitForTimeout(1500);
+  }
+
+  // ── Step 4: verify unenrolment toast ──────────────────────────────────────
+  const unenrolSels = [
+    'text=/user successfully unenrolled from course/i',
+    'text=/successfully unenrolled/i',
+    'text=/left the course/i',
+    'text=/unenrolled.*course/i',
+    '[role="alert"]:has-text("unenrolled")',
+    '[class*="toast"]:has-text("unenrolled")',
+    '[class*="toast"]:has-text("success")',
+    '[class*="snack"]:has-text("success")',
+  ];
+  let unenrolFound = false;
+  for (const sel of unenrolSels) {
+    if (await page.locator(sel).first().isVisible({ timeout: 5000 }).catch(() => false)) {
+      const txt = await page.locator(sel).first().textContent().catch(() => sel);
+      console.log(`  [leave-course] ✅ Unenrolment confirmed: "${txt?.trim().substring(0, 100)}"`);
+      unenrolFound = true;
+      break;
+    }
+  }
+  if (!unenrolFound) {
+    const failShot = `test-results/leave-course-no-toast-${Date.now()}.png`;
+    await page.screenshot({ path: failShot }).catch(() => {});
+    await test.info().attach('leave-course-no-toast', { path: failShot, contentType: 'image/png' }).catch(() => {});
+    await bugReport(page, 'leave-course-no-unenrol-toast',
+      'BUG [leave-course]: Confirmed "Leave Course" but the unenrolment success toast did NOT appear.\n' +
+      `  Expected: "User successfully unenrolled from course".\n  Screenshot: ${failShot}`);
+  }
+  return unenrolFound;
+}
+
 // ─── helper: three-dots check for an already-100% completed course ────────────
 
 async function checkThreeDotsForCompletedCourse(page: Page, coursePageUrl: string) {
@@ -670,7 +789,12 @@ async function findCourseFromExplore(
     const cards = page.locator(sel);
     const count = await cards.count().catch(() => 0);
     for (let i = 0; i < count; i++) {
-      const href = await cards.nth(i).getAttribute('href').catch(() => null);
+      const card = cards.nth(i);
+      // Only consider cards that explicitly contain the "Course" tag/label —
+      // skip cards like "Digital textbook" etc.
+      const hasCourseTag = await card.locator('text=/\\bCourse\\b/i').first().isVisible({ timeout: 200 }).catch(() => false);
+      if (!hasCourseTag) continue;
+      const href = await card.getAttribute('href').catch(() => null);
       if (!href) continue;
       const url = href.startsWith('http') ? href : `https://test.sunbirded.org${href}`;
       if (!allUrls.includes(url)) allUrls.push(url);
@@ -758,13 +882,18 @@ test.describe('Course Flow — Explore page', () => {
     await page.waitForTimeout(1500);
     await closeAnyPopup(page).catch(() => {});
 
-    // Collect all unique course URLs from the page first
+    // Collect all unique course URLs from the page first. Only include cards
+    // that explicitly contain the "Course" tag/label to avoid picking other
+    // card types such as "Digital textbook".
     const allCourseUrls: string[] = [];
     for (const sel of ['a[href*="/collection/"]', '.course-card a', '[class*="course-card"] a', '.card a[href*="course"]']) {
       const cards = page.locator(sel);
       const count = await cards.count().catch(() => 0);
       for (let i = 0; i < count; i++) {
-        const href = await cards.nth(i).getAttribute('href').catch(() => null);
+        const card = cards.nth(i);
+        const hasCourseTag = await card.locator('text=/\\bCourse\\b/i').first().isVisible({ timeout: 200 }).catch(() => false);
+        if (!hasCourseTag) continue;
+        const href = await card.getAttribute('href').catch(() => null);
         if (!href) continue;
         const url = href.startsWith('http') ? href : `https://test.sunbirded.org${href}`;
         if (!allCourseUrls.includes(url)) allCourseUrls.push(url);
@@ -957,7 +1086,11 @@ test.describe('Course Flow — Explore page', () => {
 
     if (lessonHrefs.length === 0) {
       console.log('⚠️  No lesson hrefs collected from TOC — falling back to consuming initial player only');
-      await consumeCurrentLesson(page, 'initial-player');
+      const consumed = await consumeCurrentLesson(page, 'initial-player');
+      if (!consumed) {
+        await leaveCourseViaThreeDots(page, coursePageUrl);
+        return;
+      }
     } else {
       console.log(`\nLesson list (${lessonHrefs.length} total):`);
       lessonHrefs.forEach((h, i) => console.log(`  ${i + 1}. ${h}`));
@@ -983,8 +1116,15 @@ test.describe('Course Flow — Explore page', () => {
         // Handle "must join" banner that may appear when opening a lesson
         await joinCourseViaBatch(page).catch(() => {});
 
-        await consumeCurrentLesson(page, label);
+        const consumed = await consumeCurrentLesson(page, label);
         await page.waitForTimeout(800);
+
+        // If lesson could not be completed, leave the course and stop iterating
+        if (!consumed) {
+          console.log(`  [${label}] Could not complete lesson — leaving course via ⋮ menu`);
+          await leaveCourseViaThreeDots(page, coursePageUrl);
+          break;
+        }
 
         // Re-expand and verify the lesson flipped to Completed
         await expandAllUnits(page);

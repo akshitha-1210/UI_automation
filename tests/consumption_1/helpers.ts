@@ -1,6 +1,8 @@
 import { expect, Page } from '@playwright/test';
 import fs from 'fs';
 
+export const HOME_URL = 'https://test.sunbirded.org/home';
+
 export const LOGIN_URL =
   'https://test.sunbirded.org/auth/realms/sunbird/protocol/openid-connect/auth' +
   '?redirect_uri=https%3A%2F%2Ftest.sunbirded.org%2Fportal%2Fauth%2Fcallback' +
@@ -485,3 +487,4 @@ export async function checkThreeDotsMenuActions(page: Page) {
     }
   }
 }
+

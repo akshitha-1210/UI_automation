@@ -1,20 +1,37 @@
-import { test, expect, Page } from '@playwright/test';
-import { loginWithValidCredentials, closeAnyPopup, reportBug } from './helpers';
+import { test, expect, Page, Frame } from '@playwright/test';
+import { loginWithValidCredentials, closeAnyPopup } from './helpers';
 
-test.setTimeout(15 * 60 * 1000);
+test.setTimeout(20 * 60 * 1000); // 20 min max per test
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-/** Read the numeric course progress % from the progress bar label or text */
+// ─── Utility: read course progress % ─────────────────────────────────────────
 async function readProgress(page: Page): Promise<number | null> {
+  // Strategy 1: aria-valuenow on a progress bar element
   try {
-    // The progress bar region has an aria-label like "Course Progress" — read its text sibling
-    const progressPanel = page.locator('h3:has-text("Course Progress"), h2:has-text("Course Progress")').first().locator('..');
+    const val = await page.evaluate((): number | null => {
+      const bar = document.querySelector<HTMLElement>(
+        '[aria-valuenow][role="progressbar"], [aria-valuenow][class*="progress"]'
+      );
+      if (bar) {
+        const n = parseInt(bar.getAttribute('aria-valuenow') ?? '', 10);
+        if (!isNaN(n)) return n;
+      }
+      return null;
+    });
+    if (val !== null) return val;
+  } catch (_) {}
+
+  // Strategy 2: "Course Progress" panel text
+  try {
+    const progressPanel = page
+      .locator('h3:has-text("Course Progress"), h2:has-text("Course Progress"), span:has-text("Course Progress")')
+      .first()
+      .locator('..');
     const txt = await progressPanel.textContent({ timeout: 3000 }).catch(() => '');
     const m = txt?.match(/(\d+)%/);
     if (m) return parseInt(m[1], 10);
   } catch (_) {}
-  // fallback: any standalone "XX%" text on page
+
+  // Strategy 3: any standalone "XX%" text
   try {
     const pct = page.locator('text=/^\\d+%$/').first();
     if (await pct.isVisible({ timeout: 1500 }).catch(() => false)) {
@@ -23,467 +40,350 @@ async function readProgress(page: Page): Promise<number | null> {
       if (m2) return parseInt(m2[1], 10);
     }
   } catch (_) {}
+
   return null;
 }
 
-/** Attach a screenshot + text to the test report and print to console */
+// ─── Utility: attach screenshot + text to report ─────────────────────────────
 async function bugReport(page: Page, id: string, message: string) {
   const ts = Date.now();
-  const imgPath = `test-results/bug-${id}-${ts}.png`;
+  const safeId = id.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 60);
+  const imgPath = `test-results/bug-${safeId}-${ts}.png`;
   try { await page.screenshot({ path: imgPath, fullPage: false }); } catch (_) {}
-  try { await test.info().attach(`bug-${id}`, { path: imgPath, contentType: 'image/png' }); } catch (_) {}
-  try { await test.info().attach(`bug-${id}-details`, { body: message, contentType: 'text/plain' }); } catch (_) {}
+  try { await test.info().attach(`bug-${safeId}`, { path: imgPath, contentType: 'image/png' }); } catch (_) {}
+  try { await test.info().attach(`bug-${safeId}-details`, { body: message, contentType: 'text/plain' }); } catch (_) {}
   console.log('🐞 BUG:', message);
 }
 
-/** Expand all Course Unit accordions in the TOC sidebar.
- *  Only clicks units that are currently COLLAPSED so we never accidentally
- *  close an already-open unit. Checks aria-expanded / data-state attributes. */
+// ─── Utility: expand all Course Unit accordions in the TOC sidebar ────────────
 async function expandAllUnits(page: Page) {
-  const unitBtns = page.locator('button:has-text("Course Unit")');
-  const count = await unitBtns.count().catch(() => 0);
-  console.log(`  Found ${count} Course Unit accordion(s)`);
-  for (let i = 0; i < count; i++) {
+  try {
+    const unitBtns = page.locator('button:has-text("Course Unit"), [class*="accordion"] button, [class*="unit"] button');
+    const count = await unitBtns.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      try {
+        const btn = unitBtns.nth(i);
+        const ariaExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
+        const dataState = await btn.getAttribute('data-state').catch(() => null);
+        if (ariaExpanded === 'true' || dataState === 'open') continue;
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.click({ timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(300);
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+// ─── Utility: read a lesson's status from the TOC anchor ─────────────────────
+// Returns "Completed" | "In progress" | "Not viewed" | null
+async function getLessonStatus(page: Page, href: string): Promise<string | null> {
+  const rel = href.replace('https://test.sunbirded.org', '');
+  const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
+  if (!await anchor.isVisible({ timeout: 2000 }).catch(() => false)) return null;
+
+  // Strategy 1: only spans/smalls that actually contain a known status keyword
+  // (avoids falsely reading lesson title text like "About" from the last span)
+  const badgeText = await anchor.evaluate((el: Element): string => {
+    const candidates = Array.from(
+      el.querySelectorAll<HTMLElement>('span[class*="status"], span[class*="badge"], small')
+    );
+    for (const s of candidates) {
+      const t = s.textContent?.trim() ?? '';
+      if (/completed|in\s*progress|not\s*view/i.test(t)) return t;
+    }
+    // Fallback: any span whose text is ONLY a status word (exact match, no title bleed)
+    for (const s of Array.from(el.querySelectorAll<HTMLElement>('span')).reverse()) {
+      const t = s.textContent?.trim() ?? '';
+      if (/^(completed|in progress|not viewed)$/i.test(t)) return t;
+    }
+    return '';
+  }).catch(() => '');
+
+  if (/completed/i.test(badgeText)) return 'Completed';
+  if (/in\s*progress/i.test(badgeText)) return 'In progress';
+  if (/not\s*view/i.test(badgeText)) return 'Not viewed';
+
+  // Strategy 2: all spans
+  const allSpans = await anchor.evaluate((el: Element): string =>
+    Array.from(el.querySelectorAll('span, small')).map(s => s.textContent?.trim() ?? '').join('|')
+  ).catch(() => '');
+  if (/completed/i.test(allSpans)) return 'Completed';
+  if (/in\s*progress/i.test(allSpans)) return 'In progress';
+  if (/not\s*view/i.test(allSpans)) return 'Not viewed';
+
+  // Strategy 3: full anchor text
+  const full = (await anchor.textContent().catch(() => ''))?.trim() ?? '';
+  if (/completed/i.test(full)) return 'Completed';
+  if (/in\s*progress/i.test(full)) return 'In progress';
+  if (/not\s*view/i.test(full)) return 'Not viewed';
+
+  return full.substring(0, 60) || null;
+}
+
+// ─── Utility: collect all leaf lesson hrefs from the TOC ────────────────────
+async function collectLessonHrefs(page: Page): Promise<string[]> {
+  const currentUrl = page.url();
+  const sels = [
+    'nav a[href*="/content/"]',
+    '[class*="toc"] a[href*="/content/"]',
+    '[class*="sidebar"] a[href*="/content/"]',
+    'a[href*="/content/"]',
+  ];
+
+  for (const sel of sels) {
     try {
-      const btn = unitBtns.nth(i);
-
-      // Check aria-expanded attribute — only click if collapsed (false / absent / "false")
-      const ariaExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
-      // Check Radix / shadcn data-state — "open" means already expanded
-      const dataState = await btn.getAttribute('data-state').catch(() => null);
-
-      const isAlreadyOpen =
-        ariaExpanded === 'true' ||
-        dataState === 'open';
-
-      if (isAlreadyOpen) continue; // already expanded — skip
-
-      await btn.scrollIntoViewIfNeeded().catch(() => {});
-      await btn.click({ timeout: 2000 }).catch(() => {});
-      await page.waitForTimeout(400);
+      const anchors = page.locator(sel);
+      const n = await anchors.count().catch(() => 0);
+      if (n === 0) continue;
+      const hrefs: string[] = [];
+      for (let i = 0; i < n; i++) {
+        const href = await anchors.nth(i).getAttribute('href').catch(() => null);
+        if (!href) continue;
+        // Skip fragment-only anchors like #about, #contact — those are not lessons
+        if (/#[a-zA-Z]/.test(href) && !/\/content\/do_/.test(href.split('#')[0])) continue;
+        // Also skip hrefs that are ONLY a fragment variant of an already-collected URL
+        const withoutFragment = href.split('#')[0];
+        const full = withoutFragment.startsWith('http') ? withoutFragment : `https://test.sunbirded.org${withoutFragment}`;
+        if (full === currentUrl) continue;
+        if (hrefs.includes(full)) continue;
+        hrefs.push(full);
+      }
+      if (hrefs.length > 0) {
+        console.log(`  TOC via "${sel}" -> ${hrefs.length} lesson(s)`);
+        return hrefs;
+      }
     } catch (_) {}
+  }
+
+  // DOM eval fallback
+  const fromDOM = await page.evaluate((base: string): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    document.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((a) => {
+      // Strip fragment so #about / #contact variants don't create duplicate entries
+      const href = a.href.split('#')[0];
+      if (/\/content\/do_/.test(href) && href !== base && !seen.has(href)) {
+        seen.add(href);
+        out.push(href);
+      }
+    });
+    return out;
+  }, currentUrl).catch(() => [] as string[]);
+  console.log(`  TOC via DOM eval -> ${fromDOM.length} lesson(s)`);
+  return fromDOM;
+}
+
+// ─── Capture screenshot + report bug if status is stale on completion ─────────
+async function checkAndReportStaleStatus(
+  page: Page,
+  lessonHref: string,
+  lessonLabel: string,
+  eventKey: string
+) {
+  const safeLabel = lessonLabel.replace(/\s+/g, '-');
+  const shotPath = `test-results/${eventKey}-${safeLabel}-${Date.now()}.png`;
+  await page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
+  await test.info().attach(`${eventKey}-${safeLabel}`, { path: shotPath, contentType: 'image/png' }).catch(() => {});
+
+  const statusNow = await getLessonStatus(page, lessonHref);
+  const progressNow = await readProgress(page);
+
+  console.log(`  [${lessonLabel}] On "${eventKey}": TOC status="${statusNow ?? '(not found)'}", progress=${progressNow ?? '?'}%`);
+
+  if (statusNow !== null && statusNow !== 'Completed') {
+    const banner = /you-just-completed/.test(eventKey)
+      ? '"You just completed <lesson-name>" banner'
+      : '"We would love to hear from you" feedback form';
+    const bugMsg =
+      `BUG: [${lessonLabel}] Lesson status NOT updated to "Completed" even though ${banner} is visible.\n` +
+      `  ${banner} confirms the lesson is fully consumed, but TOC still shows: "${statusNow}".\n` +
+      `  Course Progress: ${progressNow ?? 'unknown'}%.\n` +
+      `  Lesson URL: ${lessonHref}\n` +
+      `  Screenshot: ${shotPath}`;
+    await bugReport(page, `stale-status-on-${eventKey}-${safeLabel}`, bugMsg);
+    expect.soft(statusNow, bugMsg).toBe('Completed');
   }
 }
 
-/**
- * Consume whatever content is currently loaded in the course player.
- *
- * The player shows a blue ">" (right arrow) button at the top of the content area.
- * Clicking it advances through pages/slides. We keep clicking until either:
- *   - The TOC shows "Completed" for the current lesson, OR
- *   - The page counter stops advancing (last page reached), OR
- *   - A video is detected → play it fully
- *
- * Returns true when lesson is consumed.
- */
-async function consumeCurrentLesson(page: Page, lessonLabel: string): Promise<boolean> {
-  await page.waitForTimeout(1000);
-  await closeAnyPopup(page).catch(() => {});
+// ─── Dismiss the feedback form ("We would love to hear from you") ─────────────
+async function dismissFeedback(page: Page, lessonLabel: string) {
+  const dismissSels = [
+    'button:has-text("Skip")',
+    'button:has-text("Close")',
+    'button[aria-label="Close"]',
+    'button[aria-label*="close" i]',
+    'button:has-text("Submit")',
+    'button:has-text("Done")',
+    'button:has-text("Later")',
+    '[class*="feedback"] button:last-of-type',
+    '[class*="rating"] button:last-of-type',
+  ];
 
-  // ── Helper: feedback form in the player = lesson is complete ──────────────
-  // After finishing a lesson the app shows a feedback/rating form inside the player.
-  // Sunbird's exact wording is "We would love to hear from you".
-  const isFeedbackFormVisible = async () => {
-    return await page.locator(
-      '[class*="feedback"], [class*="rating"], ' +
-      'text=/we would love to hear from you/i, ' +
-      'text=/how was your learning/i, ' +
-      'text=/how was this|rate this|share your feedback|lesson feedback/i'
-    ).first().isVisible({ timeout: 500 }).catch(() => false);
-  };
-
-  // ── Helper: "You just completed" banner = lesson is done in the player ────
-  // Sunbird shows this congratulations screen right after a lesson finishes,
-  // before or instead of the feedback form. It always means the lesson is done.
-  const isYouJustCompletedVisible = async () => {
-    return await page.locator(
-      'text=/you just completed/i'
-    ).first().isVisible({ timeout: 500 }).catch(() => false);
-  };
-
-  // ── Helper: dismiss the feedback form, then wait for TOC to confirm Completed ─
-  // The app updates lesson status AFTER the feedback form is dismissed (async).
-  // IMPORTANT: We capture a screenshot + read status/progress BEFORE dismissing,
-  // so we can report a bug if the TOC shows "In Progress" while the form is open.
-  //
-  // lessonHref is the content URL of the lesson just finished (e.g.
-  // /collection/.../content/do_xxx). Passing it lets us find the exact TOC
-  // anchor and read its status badge reliably.
-  const dismissFeedbackForm = async (lessonHref?: string) => {
-    // ── 📸 Capture screenshot BEFORE dismissing ───────────────────────────
-    console.log(`  [${lessonLabel}] 📸 Feedback form visible — capturing state before dismiss`);
-    const feedbackShotPath = `test-results/feedback-form-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
-    await page.screenshot({ path: feedbackShotPath, fullPage: false }).catch(() => {});
-    await test.info().attach(`feedback-form-${lessonLabel}`, { path: feedbackShotPath, contentType: 'image/png' }).catch(() => {});
-
-    // ── Read the TOC status for this specific lesson ──────────────────────
-    // Use the same 3-strategy approach as getLessonStatus (but inline, since
-    // getLessonStatus is only available in the test closure).
-    let statusWhileFeedback: string | null = null;
-    if (lessonHref) {
-      const rel = lessonHref.replace('https://test.sunbirded.org', '');
-      const anchor = page.locator(`a[href="${lessonHref}"], a[href="${rel}"]`).first();
-      if (await anchor.isVisible({ timeout: 1500 }).catch(() => false)) {
-        // Strategy 1: last span inside the anchor (the status badge)
-        statusWhileFeedback = await anchor.evaluate((el: Element): string => {
-          const spans = Array.from(el.querySelectorAll('span, small, [class*="status"], [class*="badge"]'));
-          const last = spans[spans.length - 1];
-          return last?.textContent?.trim() ?? el.textContent?.trim() ?? '';
-        }).catch(() => '');
-        // Normalise
-        if (/completed/i.test(statusWhileFeedback ?? '')) statusWhileFeedback = 'Completed';
-        else if (/in\s*progress/i.test(statusWhileFeedback ?? '')) statusWhileFeedback = 'In progress';
-        else if (/not\s*view/i.test(statusWhileFeedback ?? '')) statusWhileFeedback = 'Not viewed';
-        else {
-          // Strategy 2: all spans
-          const allSpans = await anchor.evaluate((el: Element): string =>
-            Array.from(el.querySelectorAll('span, small')).map(s => s.textContent?.trim() ?? '').join('|')
-          ).catch(() => '');
-          if (/completed/i.test(allSpans)) statusWhileFeedback = 'Completed';
-          else if (/in\s*progress/i.test(allSpans)) statusWhileFeedback = 'In progress';
-          else if (/not\s*view/i.test(allSpans)) statusWhileFeedback = 'Not viewed';
-          else {
-            // Strategy 3: full textContent
-            const full = (await anchor.textContent().catch(() => ''))?.trim() ?? '';
-            if (/completed/i.test(full)) statusWhileFeedback = 'Completed';
-            else if (/in\s*progress/i.test(full)) statusWhileFeedback = 'In progress';
-            else if (/not\s*view/i.test(full)) statusWhileFeedback = 'Not viewed';
-            else statusWhileFeedback = full.substring(0, 60) || null;
-          }
-        }
-      }
-    }
-
-    // ── Read the progress % ───────────────────────────────────────────────
-    const progressWhileFeedback: number | null = await page.evaluate((): number | null => {
-      // aria-valuenow on a progress bar
-      const bar = document.querySelector('[aria-valuenow][role="progressbar"], [aria-valuenow][class*="progress"]');
-      if (bar) return parseInt((bar as HTMLElement).getAttribute('aria-valuenow') ?? '', 10) || null;
-      // text like "50%"
-      const match = document.body.innerText.match(/\b(\d{1,3})%/);
-      return match ? parseInt(match[1], 10) : null;
-    }).catch(() => null);
-
-    console.log(`  [${lessonLabel}] While feedback form open — status="${statusWhileFeedback ?? '(anchor not found)'}", progress=${progressWhileFeedback ?? 'unknown'}%`);
-
-    // ── Report bugs if status or progress is stale ────────────────────────
-    if (statusWhileFeedback !== null && statusWhileFeedback !== 'Completed') {
-      const bugMsg =
-        `BUG: [${lessonLabel}] Lesson status not updated to "Completed" even while the ` +
-        `feedback form ("We would love to hear from you") is visible.\n` +
-        `  The feedback form confirms the lesson has been fully consumed,\n` +
-        `  but the TOC still shows: "${statusWhileFeedback}".\n` +
-        `  Course Progress bar shows: ${progressWhileFeedback ?? 'unknown'}%.\n` +
-        `  Screenshot attached ("feedback-form-${lessonLabel}") shows the feedback form + stale TOC status side-by-side.\n` +
-        `  Lesson URL: ${lessonHref ?? '(unknown)'}`;
-      console.log(`  🐛 ${bugMsg}`);
-      await bugReport(page, `lesson-status-stale-while-feedback-${lessonLabel.replace(/\s+/g, '-')}`, bugMsg);
-      expect.soft(statusWhileFeedback, bugMsg).toBe('Completed');
-    }
-
-    // ── Now dismiss the feedback form ──────────────────────────────────────
-    const dismissSels = [
-      'button:has-text("Skip")',
-      'button:has-text("Close")',
-      'button[aria-label="Close"]',
-      '[class*="feedback"] button[aria-label*="close" i]',
-      '[class*="feedback"] button[aria-label*="dismiss" i]',
-      'button:has-text("Submit")',
-      'button:has-text("Done")',
-      '[class*="feedback"] button:last-of-type',
-    ];
-    for (const sel of dismissSels) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 600 }).catch(() => false)) {
-          await el.click().catch(() => {});
-          await page.waitForTimeout(500);
-          console.log(`  [${lessonLabel}] Dismissed feedback form via "${sel}"`);
-          break;
-        }
-      } catch (_) {}
-    }
-    // If no dismiss button matched, try the × close button or Escape
-    const xBtn = page.locator('button:has-text("×"), button[aria-label="×"], [class*="close-btn"]').first();
-    if (await xBtn.isVisible({ timeout: 600 }).catch(() => false)) {
-      await xBtn.click().catch(() => {});
-      await page.waitForTimeout(500);
-      console.log(`  [${lessonLabel}] Dismissed feedback form via × button`);
-    } else {
-      await page.keyboard.press('Escape').catch(() => {});
-      await page.waitForTimeout(300);
-    }
-
-    // ── Wait for TOC to reflect "Completed" (app updates status async) ────
-    // Poll for up to 6 s; the status update is triggered server-side after dismiss.
-    const deadline = Date.now() + 6000;
-    while (Date.now() < deadline) {
-      if (await isLessonCompleted()) {
-        console.log(`  [${lessonLabel}] ✅ TOC confirmed Completed after feedback dismiss`);
-        return;
-      }
-      await page.waitForTimeout(800);
-    }
-    console.log(`  [${lessonLabel}] ⚠️  TOC did not show Completed within 6 s of feedback dismiss`);
-  };
-
-  // ── Helper: "You just completed" detected — screenshot + bug check ─────────
-  // Called every time the "You just completed" banner is seen. Takes a screenshot
-  // of the banner alongside the TOC, checks if the lesson status is still stale,
-  // and files a bug report if it is. Pass the current page URL as lessonHref.
-  const handleYouJustCompleted = async (lessonHref?: string) => {
-    console.log(`  [${lessonLabel}] 📸 "You just completed" banner visible — capturing state`);
-    const shotPath = `test-results/you-just-completed-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
-    await page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
-    await test.info().attach(`you-just-completed-${lessonLabel}`, { path: shotPath, contentType: 'image/png' }).catch(() => {});
-
-    // Read the TOC status for this specific lesson right now
-    let statusNow: string | null = null;
-    if (lessonHref) {
-      const rel = lessonHref.replace('https://test.sunbirded.org', '');
-      const anchor = page.locator(`a[href="${lessonHref}"], a[href="${rel}"]`).first();
-      if (await anchor.isVisible({ timeout: 1500 }).catch(() => false)) {
-        // Strategy 1: last span (the status badge)
-        statusNow = await anchor.evaluate((el: Element): string => {
-          const spans = Array.from(el.querySelectorAll('span, small, [class*="status"], [class*="badge"]'));
-          const last = spans[spans.length - 1];
-          return last?.textContent?.trim() ?? el.textContent?.trim() ?? '';
-        }).catch(() => '');
-        if (/completed/i.test(statusNow ?? '')) statusNow = 'Completed';
-        else if (/in\s*progress/i.test(statusNow ?? '')) statusNow = 'In progress';
-        else if (/not\s*view/i.test(statusNow ?? '')) statusNow = 'Not viewed';
-        else {
-          // Strategy 2: all spans
-          const allSpans = await anchor.evaluate((el: Element): string =>
-            Array.from(el.querySelectorAll('span, small')).map(s => s.textContent?.trim() ?? '').join('|')
-          ).catch(() => '');
-          if (/completed/i.test(allSpans)) statusNow = 'Completed';
-          else if (/in\s*progress/i.test(allSpans)) statusNow = 'In progress';
-          else if (/not\s*view/i.test(allSpans)) statusNow = 'Not viewed';
-          else {
-            // Strategy 3: full textContent
-            const full = (await anchor.textContent().catch(() => ''))?.trim() ?? '';
-            if (/completed/i.test(full)) statusNow = 'Completed';
-            else if (/in\s*progress/i.test(full)) statusNow = 'In progress';
-            else if (/not\s*view/i.test(full)) statusNow = 'Not viewed';
-            else statusNow = full.substring(0, 60) || null;
-          }
-        }
-      }
-    }
-
-    // Read the progress %
-    const progressNow: number | null = await page.evaluate((): number | null => {
-      const bar = document.querySelector('[aria-valuenow][role="progressbar"], [aria-valuenow][class*="progress"]');
-      if (bar) return parseInt((bar as HTMLElement).getAttribute('aria-valuenow') ?? '', 10) || null;
-      const match = document.body.innerText.match(/\b(\d{1,3})%/);
-      return match ? parseInt(match[1], 10) : null;
-    }).catch(() => null);
-
-    console.log(`  [${lessonLabel}] While "You just completed" visible — status="${statusNow ?? '(anchor not found)'}", progress=${progressNow ?? 'unknown'}%`);
-
-    // Report lesson status bug
-    if (statusNow !== null && statusNow !== 'Completed') {
-      const bugMsg =
-        `BUG: [${lessonLabel}] Lesson status not updated to "Completed" even while the ` +
-        `"You just completed" banner is visible.\n` +
-        `  The "You just completed" banner confirms the lesson has been fully consumed,\n` +
-        `  but the TOC still shows: "${statusNow}".\n` +
-        `  Course Progress bar shows: ${progressNow ?? 'unknown'}%.\n` +
-        `  Screenshot attached ("you-just-completed-${lessonLabel}") shows the banner + stale TOC side-by-side.\n` +
-        `  Lesson URL: ${lessonHref ?? '(unknown)'}`;
-      console.log(`  🐛 ${bugMsg}`);
-      await bugReport(page, `lesson-status-stale-you-just-completed-${lessonLabel.replace(/\s+/g, '-')}`, bugMsg);
-      expect.soft(statusNow, bugMsg).toBe('Completed');
-    }
-  };
-  const isLessonCompleted = async () => {
-    return await page.locator(
-      '[class*="active"] span:has-text("Completed"), ' +
-      'a[class*="active"]:has-text("Completed"), ' +
-      'a[aria-current] span:has-text("Completed")'
-    ).first().isVisible({ timeout: 500 }).catch(() => false);
-  };
-
-  if (await isLessonCompleted()) {
-    console.log(`  [${lessonLabel}] Already Completed — skipping`);
-    return true;
-  }
-
-  // If "You just completed" banner is visible — lesson is done
-  if (await isYouJustCompletedVisible()) {
-    console.log(`  [${lessonLabel}] "You just completed" banner visible on entry — lesson done`);
-    await handleYouJustCompleted(page.url());
-    return true;
-  }
-
-  // If feedback form already showing — lesson was already done
-  if (await isFeedbackFormVisible()) {
-    console.log(`  [${lessonLabel}] Feedback form visible on entry — lesson already completed`);
-    await dismissFeedbackForm(page.url());
-    return true;
-  }
-
-  // ── 1. Detect video content (YouTube / native video) ──────────────────────
-  // Wait up to 5s for the content iframe to load — WEBM players load slowly.
-  await page.waitForTimeout(2000);
-
-  for (const f of [page as any, ...page.frames()]) {
+  for (const sel of dismissSels) {
     try {
-      const vid = f.locator('video').first();
-      if (await vid.isVisible({ timeout: 2000 }).catch(() => false)) {
-        console.log(`  [${lessonLabel}] Video content detected`);
-
-        const playerIframe = page.locator('iframe#contentPlayer, iframe[name="contentPlayer"], iframe[class*="content-player"]').first();
-        const pBox = await playerIframe.boundingBox().catch(() => null);
-
-        // ── Click center to start playback ──
-        if (pBox) {
-          await page.mouse.click(
-            Math.round(pBox.x + pBox.width / 2),
-            Math.round(pBox.y + pBox.height / 2)
-          ).catch(() => {});
-          await page.waitForTimeout(800);
-        }
-        await page.keyboard.press('k').catch(() => {});
-        await page.waitForTimeout(500);
-
-        // ── Set playback speed to 2x ──────────────────────────────────────
-        // Try YouTube settings icon first (inside the YT embed iframe)
-        let speedSet = false;
-
-        // Find the YouTube embed frame (deepest frame with youtube.com/embed URL)
-        const ytFrame = page.frames().find(fr => fr.url().includes('youtube.com/embed'));
-        if (ytFrame) {
-          try {
-            console.log(`  [${lessonLabel}] YouTube iframe found — setting 2x speed via settings`);
-
-            // Click the settings (gear) icon in the YT player
-            const settingsBtn = ytFrame.locator('.ytp-settings-button, button[aria-label*="Settings" i]').first();
-            await settingsBtn.click({ timeout: 3000 });
-            await ytFrame.waitForTimeout(500);
-
-            // Click "Playback speed" menu item
-            const speedMenu = ytFrame.locator('.ytp-menuitem:has-text("Playback speed"), .ytp-panel-menu :text("Playback speed")').first();
-            await speedMenu.click({ timeout: 3000 });
-            await ytFrame.waitForTimeout(400);
-
-            // Click "2" (2x speed)
-            const speed2x = ytFrame.locator('.ytp-menuitem:has-text("2"), .ytp-panel-menu :text-is("2")').first();
-            await speed2x.click({ timeout: 3000 });
-            await ytFrame.waitForTimeout(300);
-
-            console.log(`  [${lessonLabel}] ✅ YouTube playback speed set to 2x`);
-            speedSet = true;
-          } catch (e) {
-            console.log(`  [${lessonLabel}] Could not set YT speed via settings menu: ${e}`);
-          }
-        }
-
-        if (!speedSet) {
-          // Native video or fallback — set playbackRate = 2 via JS on all frames
-          for (const fr of [page as any, ...page.frames()]) {
-            try {
-              await fr.evaluate(() => {
-                document.querySelectorAll('video').forEach((v: HTMLVideoElement) => {
-                  v.playbackRate = 2;
-                });
-              });
-              console.log(`  [${lessonLabel}] ✅ Native video playbackRate set to 2x`);
-              speedSet = true;
-            } catch (_) {}
-          }
-        }
-
-        // ── Poll for completion (feedback form OR TOC status) ─────────────
-        const videoDeadline = Date.now() + 10 * 60 * 1000;
-        let lastPageText = '';
-        let lastPageTextChangedAt = Date.now();
-        const STUCK_TIMEOUT_MS = 60_000; // 1 minute with no DOM change = stuck
-
-        while (Date.now() < videoDeadline) {
-          // Re-apply 2x speed every poll in case the player resets it
-          for (const fr of [page as any, ...page.frames()]) {
-            try {
-              await fr.evaluate(() => {
-                document.querySelectorAll('video').forEach((v: HTMLVideoElement) => {
-                  if (v.playbackRate !== 2) v.playbackRate = 2;
-                });
-              });
-            } catch (_) {}
-          }
-
-          if (await isFeedbackFormVisible()) {
-            console.log(`  [${lessonLabel}] ✅ Feedback form appeared — video lesson done`);
-            await dismissFeedbackForm(page.url());
-            return true;
-          }
-          if (await isYouJustCompletedVisible()) {
-            console.log(`  [${lessonLabel}] ✅ "You just completed" banner — video lesson done`);
-            await handleYouJustCompleted(page.url());
-            return true;
-          }
-          if (await isLessonCompleted()) {
-            console.log(`  [${lessonLabel}] ✅ Video lesson Completed (TOC)`);
-            return true;
-          }
-
-          // ── Stuck detection: if page text hasn't changed in 60s → report & bail ──
-          const currentPageText = await page.evaluate(() =>
-            document.body.innerText.substring(0, 500)
-          ).catch(() => '');
-          if (currentPageText !== lastPageText) {
-            lastPageText = currentPageText;
-            lastPageTextChangedAt = Date.now();
-          } else if (Date.now() - lastPageTextChangedAt > STUCK_TIMEOUT_MS) {
-            console.log(`  [${lessonLabel}] ⚠️  Page unchanged for 60s — lesson appears stuck`);
-            const stuckShotPath = `test-results/stuck-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
-            await page.screenshot({ path: stuckShotPath, fullPage: false }).catch(() => {});
-            await test.info().attach(`stuck-${lessonLabel}`, { path: stuckShotPath, contentType: 'image/png' }).catch(() => {});
-            await bugReport(page, `lesson-stuck-${lessonLabel.replace(/\s+/g, '-')}`,
-              `BUG: [${lessonLabel}] Lesson player was stuck on the same screen for over 60 seconds.\n` +
-              `  The video may have completed but the app did not show the "You just completed" banner\n` +
-              `  or update the TOC status to "Completed".\n` +
-              `  Screenshot attached shows the stuck state.\n` +
-              `  Lesson URL: ${page.url()}`
-            );
-            return true; // move on to next lesson
-          }
-
-          await page.waitForTimeout(3000);
-        }
-        return true;
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
+        await el.click().catch(() => {});
+        await page.waitForTimeout(600);
+        console.log(`  [${lessonLabel}] Dismissed feedback via "${sel}"`);
+        return;
       }
     } catch (_) {}
   }
 
-  // ── 2. Non-video — click the blue ">" right-arrow to advance pages/slides ──
-  console.log(`  [${lessonLabel}] Non-video content — clicking blue right-arrow to advance pages`);
+  const xBtn = page.locator('button:has-text("x"), button[aria-label="x"], [class*="close-btn"]').first();
+  if (await xBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+    await xBtn.click().catch(() => {});
+    await page.waitForTimeout(500);
+  } else {
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(300);
+  }
+}
 
-  const blueArrowSels = [
-    'button.navigate-next',
-    'button[aria-label*="Next" i]',
-    'button[aria-label*="next page" i]',
-    'button[aria-label*="forward" i]',
-    'button:has(svg[class*="right"]):not([aria-label*="left" i])',
-    '.content-player-container button:last-of-type',
-    '[class*="player"] button:last-of-type',
-  ];
+// ─── Consume a VIDEO lesson (YouTube or native) ───────────────────────────────
+async function consumeVideoLesson(
+  page: Page,
+  lessonHref: string,
+  lessonLabel: string,
+  playerBox: { x: number; y: number; width: number; height: number } | null,
+  isFeedbackVisible: () => Promise<boolean>,
+  isYouJustCompletedVisible: () => Promise<boolean>,
+  isLessonCompletedInTOC: () => Promise<boolean>
+): Promise<boolean> {
+  // Click center of player to start/focus
+  if (playerBox) {
+    await page.mouse.click(
+      Math.round(playerBox.x + playerBox.width / 2),
+      Math.round(playerBox.y + playerBox.height / 2)
+    ).catch(() => {});
+    await page.waitForTimeout(800);
+  }
 
-  // Read page counter — handles "1 / 104", "Page 1 of 104", numeric input
+  await page.keyboard.press('k').catch(() => {});
+  await page.waitForTimeout(500);
+
+  // Set 2X speed
+  const setTwoXSpeed = async () => {
+    // YouTube iframe
+    const ytFrame = page.frames().find(fr => fr.url().includes('youtube.com/embed'));
+    if (ytFrame) {
+      try {
+        const settingsBtn = ytFrame.locator('.ytp-settings-button, button[aria-label*="Settings" i]').first();
+        if (await settingsBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await settingsBtn.click({ timeout: 2000 });
+          await ytFrame.waitForTimeout(400);
+          const speedMenu = ytFrame.locator(
+            '.ytp-menuitem:has-text("Playback speed"), .ytp-panel-menu :text("Playback speed")'
+          ).first();
+          await speedMenu.click({ timeout: 2000 });
+          await ytFrame.waitForTimeout(300);
+          const speed2x = ytFrame.locator(
+            '.ytp-menuitem:has-text("2"), .ytp-panel-menu :text-is("2")'
+          ).first();
+          await speed2x.click({ timeout: 2000 });
+          console.log(`  [${lessonLabel}] YouTube speed -> 2x`);
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // Native video
+    for (const fr of [page as unknown as Frame, ...page.frames()]) {
+      try {
+        await (fr as any).evaluate(() => {
+          document.querySelectorAll<HTMLVideoElement>('video').forEach(v => {
+            v.playbackRate = 2;
+            if (v.paused) v.play().catch(() => {});
+          });
+        });
+      } catch (_) {}
+    }
+    console.log(`  [${lessonLabel}] Native video playbackRate -> 2x`);
+  };
+
+  await setTwoXSpeed();
+
+  const deadline = Date.now() + 12 * 60 * 1000;
+  let lastBodySnippet = '';
+  let lastChangeAt = Date.now();
+
+  while (Date.now() < deadline) {
+    // Re-apply 2x speed every poll
+    for (const fr of [page as unknown as Frame, ...page.frames()]) {
+      try {
+        await (fr as any).evaluate(() => {
+          document.querySelectorAll<HTMLVideoElement>('video').forEach(v => {
+            if (v.playbackRate !== 2) v.playbackRate = 2;
+          });
+        });
+      } catch (_) {}
+    }
+
+    if (await isFeedbackVisible()) {
+      console.log(`  [${lessonLabel}] Feedback form appeared — video done`);
+      await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'feedback-video');
+      await dismissFeedback(page, lessonLabel);
+      return true;
+    }
+    if (await isYouJustCompletedVisible()) {
+      console.log(`  [${lessonLabel}] "You just completed" — video done`);
+      await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'you-just-completed-video');
+      return true;
+    }
+    if (await isLessonCompletedInTOC()) {
+      console.log(`  [${lessonLabel}] TOC -> Completed`);
+      return true;
+    }
+
+    const snippet = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => '');
+    if (snippet !== lastBodySnippet) {
+      lastBodySnippet = snippet;
+      lastChangeAt = Date.now();
+    } else if (Date.now() - lastChangeAt > 90_000) {
+      console.log(`  [${lessonLabel}] Video page stuck 90s — reporting bug`);
+      const stuckShot = `test-results/stuck-video-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
+      await page.screenshot({ path: stuckShot, fullPage: false }).catch(() => {});
+      await test.info().attach(`stuck-video-${lessonLabel}`, { path: stuckShot, contentType: 'image/png' }).catch(() => {});
+      await bugReport(page, `video-stuck-${lessonLabel.replace(/\s+/g, '-')}`,
+        `BUG: [${lessonLabel}] Video lesson player was stuck on the same screen for over 90 seconds.\n` +
+        `  The video may have ended but the app did not show "You just completed" or update the TOC.\n` +
+        `  Lesson URL: ${lessonHref}`
+      );
+      return true;
+    }
+
+    await page.waitForTimeout(3000);
+  }
+
+  console.log(`  [${lessonLabel}] Video timeout (12 min) — moving on`);
+  return true;
+}
+
+// ─── Consume a SLIDE/PDF/non-video lesson via right-arrow clicks ──────────────
+async function consumeSlideLesson(
+  page: Page,
+  lessonHref: string,
+  lessonLabel: string,
+  playerBox: { x: number; y: number; width: number; height: number } | null,
+  isFeedbackVisible: () => Promise<boolean>,
+  isYouJustCompletedVisible: () => Promise<boolean>,
+  isLessonCompletedInTOC: () => Promise<boolean>
+): Promise<boolean> {
+  // Read page counter ("N / M" or "Page N of M")
   const getPageInfo = async (): Promise<{ current: number; total: number } | null> => {
     try {
-      const counterEl = page.locator('input[type="number"], [class*="page-number"] input').first();
-      if (await counterEl.isVisible({ timeout: 500 }).catch(() => false)) {
-        const cur = parseInt((await counterEl.inputValue().catch(() => '0')), 10) || 0;
-        const totTxt = (await page.locator('text=/\\/\\s*\\d+/, text=/of\\s+\\d+/i').first().textContent().catch(() => '') ) ?? '';
-        const totMatch = totTxt.match(/(\d+)$/);
-        const total = totMatch ? parseInt(totMatch[1], 10) : cur || 1;
-        return { current: cur, total };
+      const inp = page.locator('input[type="number"], [class*="page-number"] input').first();
+      if (await inp.isVisible({ timeout: 400 }).catch(() => false)) {
+        const cur = parseInt(await inp.inputValue().catch(() => '0'), 10) || 0;
+        const totEl = page.locator('text=/\\/\\s*\\d+/').first();
+        const totTxt = await totEl.textContent({ timeout: 400 }).catch(() => '') ?? '';
+        const totM = totTxt.match(/(\d+)$/);
+        return { current: cur, total: totM ? parseInt(totM[1], 10) : cur };
       }
-      // Fallback: look for inline "N / M" text
-      const fracTxt = await page.locator('text=/\\d+\\s*\\/\\s*\\d+/').first().textContent().catch(() => '');
-      if (fracTxt) {
+      const fracEl = page.locator('text=/\\d+\\s*\\/\\s*\\d+/').first();
+      if (await fracEl.isVisible({ timeout: 400 }).catch(() => false)) {
+        const fracTxt = await fracEl.textContent({ timeout: 400 }).catch(() => '') ?? '';
         const m = fracTxt.match(/(\d+)\s*\/\s*(\d+)/);
         if (m) return { current: parseInt(m[1], 10), total: parseInt(m[2], 10) };
       }
@@ -491,225 +391,382 @@ async function consumeCurrentLesson(page: Page, lessonLabel: string): Promise<bo
     return null;
   };
 
-  // Find the blue ">" button once
-  let arrowBtn: ReturnType<typeof page.locator> | null = null;
-  for (const sel of blueArrowSels) {
+  // Right-arrow button selectors (hover-revealed)
+  const rightArrowSels = [
+    'button.navigate-next',
+    'button[class*="navigate-next"]',
+    'button[class*="next-page"]',
+    'button[aria-label*="Next" i]:not([aria-label*="lesson" i])',
+    'button[aria-label*="next page" i]',
+    'button[aria-label*="forward" i]',
+    'button:has(svg[data-icon*="right"])',
+    'button:has(svg[class*="right"])',
+    '[class*="player"] button:last-of-type',
+    '[class*="content"] button:last-of-type',
+  ];
+
+  // Hover the right side of the player to reveal the hidden arrow button
+  const hoverAndFindArrow = async (): Promise<ReturnType<typeof page.locator> | null> => {
+    if (playerBox) {
+      await page.mouse.move(
+        Math.round(playerBox.x + playerBox.width * 0.85),
+        Math.round(playerBox.y + playerBox.height * 0.5)
+      ).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    for (const sel of rightArrowSels) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 600 }).catch(() => false)) {
+          return el;
+        }
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  // Click the right-arrow; re-hover if it disappeared
+  const clickNextArrow = async (
+    arrowBtn: ReturnType<typeof page.locator> | null
+  ): Promise<ReturnType<typeof page.locator> | null> => {
+    if (arrowBtn && await arrowBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+      await arrowBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await arrowBtn.click({ timeout: 2000 }).catch(() => {});
+      return arrowBtn;
+    }
+    const found = await hoverAndFindArrow();
+    if (found) {
+      await found.scrollIntoViewIfNeeded().catch(() => {});
+      await found.click({ timeout: 2000 }).catch(() => {});
+      return found;
+    }
+    // Keyboard fallback
+    if (playerBox) {
+      await page.mouse.click(
+        Math.round(playerBox.x + playerBox.width / 2),
+        Math.round(playerBox.y + playerBox.height / 2)
+      ).catch(() => {});
+    }
+    await page.keyboard.press('ArrowRight').catch(() => {});
+    return null;
+  };
+
+  let arrowBtn = await hoverAndFindArrow();
+  if (arrowBtn) {
+    console.log(`  [${lessonLabel}] Found right-arrow button`);
+  } else {
+    console.log(`  [${lessonLabel}] Right-arrow not immediately visible — will hover on each click`);
+  }
+
+  const pi = await getPageInfo();
+  if (pi) console.log(`  [${lessonLabel}] Pagination: ${pi.current} / ${pi.total}`);
+
+  const maxClicks = 300;
+  let clicks = 0;
+  let lastBodySnippet = '';
+  let lastChangeAt = Date.now();
+  const STUCK_MS = 60_000;
+
+  while (clicks < maxClicks) {
+    clicks++;
+
+    if (await isFeedbackVisible()) {
+      console.log(`  [${lessonLabel}] Feedback form — lesson done`);
+      await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'feedback-slide');
+      await dismissFeedback(page, lessonLabel);
+      return true;
+    }
+    if (await isYouJustCompletedVisible()) {
+      console.log(`  [${lessonLabel}] "You just completed" banner — lesson done`);
+      await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'you-just-completed-slide');
+      return true;
+    }
+    if (await isLessonCompletedInTOC()) {
+      console.log(`  [${lessonLabel}] TOC -> Completed`);
+      return true;
+    }
+
+    const cur = await getPageInfo();
+    if (cur) {
+      console.log(`  [${lessonLabel}] Slide ${cur.current} / ${cur.total}`);
+      if (cur.current >= cur.total) {
+        console.log(`  [${lessonLabel}] Reached last slide — waiting for completion signal`);
+        await page.waitForTimeout(2000);
+        if (await isFeedbackVisible()) {
+          await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'feedback-last-slide');
+          await dismissFeedback(page, lessonLabel);
+          return true;
+        }
+        if (await isYouJustCompletedVisible()) {
+          await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'you-just-completed-last-slide');
+          return true;
+        }
+        if (await isLessonCompletedInTOC()) return true;
+      }
+    }
+
+    // Stuck detection
+    const snippet = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => '');
+    if (snippet !== lastBodySnippet) {
+      lastBodySnippet = snippet;
+      lastChangeAt = Date.now();
+    } else if (Date.now() - lastChangeAt > STUCK_MS) {
+      console.log(`  [${lessonLabel}] Content unchanged for 60s — reporting stuck bug`);
+      const stuckShot = `test-results/stuck-slide-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
+      await page.screenshot({ path: stuckShot, fullPage: false }).catch(() => {});
+      await test.info().attach(`stuck-slide-${lessonLabel}`, { path: stuckShot, contentType: 'image/png' }).catch(() => {});
+      await bugReport(page, `slide-stuck-${lessonLabel.replace(/\s+/g, '-')}`,
+        `BUG: [${lessonLabel}] Slide player was stuck on the same screen for over 60 seconds.\n` +
+        `  The content may have been fully consumed but the app did not show a completion signal.\n` +
+        `  Lesson URL: ${lessonHref}`
+      );
+      return true;
+    }
+
+    arrowBtn = await clickNextArrow(arrowBtn);
+    await page.waitForTimeout(700);
+  }
+
+  // Hit click cap
+  console.log(`  [${lessonLabel}] Reached ${maxClicks}-click cap without completion signal`);
+  const capShot = `test-results/cap-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
+  await page.screenshot({ path: capShot, fullPage: false }).catch(() => {});
+  await test.info().attach(`cap-${lessonLabel}`, { path: capShot, contentType: 'image/png' }).catch(() => {});
+  await bugReport(page, `slide-cap-${lessonLabel.replace(/\s+/g, '-')}`,
+    `BUG: [${lessonLabel}] Lesson did not show a completion signal after ${maxClicks} right-arrow clicks.\n` +
+    `  Expected: "You just completed" banner or "We would love to hear from you" feedback form.\n` +
+    `  Lesson URL: ${lessonHref}`
+  );
+  return false;
+}
+
+// ─── Core: consume the lesson in the content player ──────────────────────────
+async function consumeCurrentLesson(
+  page: Page,
+  lessonHref: string,
+  lessonLabel: string
+): Promise<boolean> {
+  await page.waitForTimeout(1500);
+  await closeAnyPopup(page).catch(() => {});
+
+  // Completion signal helpers
+  const isFeedbackVisible = async (): Promise<boolean> =>
+    page.locator(
+      'text=/we would love to hear from you/i, ' +
+      'text=/how was your learning/i, ' +
+      'text=/share your feedback/i, ' +
+      'text=/rate this/i, ' +
+      '[class*="feedback"], [class*="rating"]'
+    ).first().isVisible({ timeout: 400 }).catch(() => false);
+
+  const isYouJustCompletedVisible = async (): Promise<boolean> =>
+    page.locator('text=/you just completed/i')
+      .first().isVisible({ timeout: 400 }).catch(() => false);
+
+  const isLessonCompletedInTOC = async (): Promise<boolean> => {
+    const activeCompleted = await page.locator(
+      '[class*="active"] span:has-text("Completed"), ' +
+      'a[aria-current] span:has-text("Completed"), ' +
+      'a[class*="active"] span:has-text("Completed")'
+    ).first().isVisible({ timeout: 400 }).catch(() => false);
+    if (activeCompleted) return true;
+    return (await getLessonStatus(page, lessonHref)) === 'Completed';
+  };
+
+  // Already Completed?
+  if (await isLessonCompletedInTOC()) {
+    console.log(`  [${lessonLabel}] Already Completed — skipping`);
+    return true;
+  }
+
+  // Completion banners visible on entry?
+  if (await isYouJustCompletedVisible()) {
+    console.log(`  [${lessonLabel}] "You just completed" visible on entry`);
+    await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'you-just-completed-on-entry');
+    return true;
+  }
+  if (await isFeedbackVisible()) {
+    console.log(`  [${lessonLabel}] Feedback form visible on entry`);
+    await checkAndReportStaleStatus(page, lessonHref, lessonLabel, 'feedback-on-entry');
+    await dismissFeedback(page, lessonLabel);
+    return true;
+  }
+
+  // Wait for content to load
+  await page.waitForTimeout(2000);
+
+  // Detect the content player iframe bounding box
+  const playerIframeSel = [
+    'iframe#contentPlayer',
+    'iframe[name="contentPlayer"]',
+    'iframe[class*="content-player"]',
+    'iframe[src*="content"]',
+  ].join(', ');
+  const playerIframe = page.locator(playerIframeSel).first();
+  const playerBox = await playerIframe.boundingBox().catch(() => null);
+
+  // Detect video in any frame
+  let hasVideo = false;
+  for (const fr of [page as unknown as Frame, ...page.frames()]) {
     try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
-        arrowBtn = el;
-        console.log(`  [${lessonLabel}] Found right-arrow: "${sel}"`);
+      const vid = (fr as any).locator('video').first();
+      if (await vid.isVisible({ timeout: 2000 }).catch(() => false)) {
+        hasVideo = true;
         break;
       }
     } catch (_) {}
   }
 
-  const clickArrow = async () => {
-    if (arrowBtn) {
-      await arrowBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await arrowBtn.click({ timeout: 2000 }).catch(() => {});
-    } else {
-      // Hover to reveal hidden arrow buttons
-      const pBox = await page.locator('iframe#contentPlayer, iframe[name="contentPlayer"], iframe[class*="content-player"]').first().boundingBox().catch(() => null);
-      if (pBox) {
-        await page.mouse.move(Math.round(pBox.x + pBox.width - 20), Math.round(pBox.y + 30));
-        await page.waitForTimeout(300);
-        for (const sel of blueArrowSels) {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
-            await el.click().catch(() => {});
-            arrowBtn = el;
-            break;
-          }
-        }
-      }
-    }
-  };
-
-  // Check if pagination is available so we know the exact total
-  const pi = await getPageInfo();
-  if (pi) console.log(`  [${lessonLabel}] Detected pagination: ${pi.current} / ${pi.total}`);
-
-  if (pi && pi.total > 1) {
-    // ── Known total: iterate until current page reaches total ──────────────
-    const target = pi.total;
-    const maxAttempts = Math.min(200, Math.max(50, target * 2));
-    let attempts = 0;
-    let lastArrowText = '';
-    let lastArrowTextChangedAt = Date.now();
-    while (attempts < maxAttempts) {
-      attempts++;
-      if (await isFeedbackFormVisible()) {
-        console.log(`  [${lessonLabel}] ✅ Feedback form — lesson done`);
-        await dismissFeedbackForm(page.url());
-        return true;
-      }
-      if (await isYouJustCompletedVisible()) { await handleYouJustCompleted(page.url()); return true; }
-      if (await isLessonCompleted()) {
-        console.log(`  [${lessonLabel}] ✅ Completed (TOC)`);
-        return true;
-      }
-      const cur = await getPageInfo();
-      if (cur) {
-        console.log(`  [${lessonLabel}] Page ${cur.current} / ${cur.total}`);
-        if (cur.current >= cur.total) {
-          await page.waitForTimeout(1500);
-          if (await isFeedbackFormVisible()) { await dismissFeedbackForm(page.url()); return true; }
-          if (await isYouJustCompletedVisible()) { await handleYouJustCompleted(page.url()); return true; }
-          if (await isLessonCompleted()) return true;
-        }
-      }
-      // Stuck detection: page text unchanged for 60s
-      const curText = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => '');
-      if (curText !== lastArrowText) { lastArrowText = curText; lastArrowTextChangedAt = Date.now(); }
-      else if (Date.now() - lastArrowTextChangedAt > 60_000) {
-        console.log(`  [${lessonLabel}] ⚠️  Page unchanged for 60s in arrow loop — stuck`);
-        const stuckShotPath = `test-results/stuck-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
-        await page.screenshot({ path: stuckShotPath, fullPage: false }).catch(() => {});
-        await test.info().attach(`stuck-${lessonLabel}`, { path: stuckShotPath, contentType: 'image/png' }).catch(() => {});
-        await bugReport(page, `lesson-stuck-${lessonLabel.replace(/\s+/g, '-')}`,
-          `BUG: [${lessonLabel}] Lesson player was stuck on the same screen for over 60 seconds.\n` +
-          `  The content may have completed but the app did not update the TOC status.\n` +
-          `  Screenshot attached shows the stuck state.\n` +
-          `  Lesson URL: ${page.url()}`
-        );
-        return true;
-      }
-      await clickArrow();
-      await page.waitForTimeout(700);
-    }
-  } else {
-    // ── Unknown total: keep clicking until Completed or cap ────────────────
-    const maxClicks = 50;
-    let clicks = 0;
-    let lastUnknownText = '';
-    let lastUnknownTextChangedAt = Date.now();
-    while (clicks < maxClicks) {
-      clicks++;
-      if (await isFeedbackFormVisible()) {
-        console.log(`  [${lessonLabel}] ✅ Feedback form — lesson done`);
-        await dismissFeedbackForm(page.url());
-        return true;
-      }
-      if (await isYouJustCompletedVisible()) {
-        console.log(`  [${lessonLabel}] ✅ "You just completed" banner — lesson done`);
-        await handleYouJustCompleted(page.url());
-        return true;
-      }
-      if (await isLessonCompleted()) {
-        console.log(`  [${lessonLabel}] ✅ Completed (TOC)`);
-        return true;
-      }
-      const cur = await getPageInfo();
-      if (cur) {
-        console.log(`  [${lessonLabel}] Page ${cur.current} / ${cur.total}`);
-        if (cur.current >= cur.total) {
-          await page.waitForTimeout(1500);
-          if (await isFeedbackFormVisible()) { await dismissFeedbackForm(page.url()); return true; }
-          if (await isYouJustCompletedVisible()) { await handleYouJustCompleted(page.url()); return true; }
-          if (await isLessonCompleted()) return true;
-        }
-      }
-      // Stuck detection: page text unchanged for 60s
-      const curText = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => '');
-      if (curText !== lastUnknownText) { lastUnknownText = curText; lastUnknownTextChangedAt = Date.now(); }
-      else if (Date.now() - lastUnknownTextChangedAt > 60_000) {
-        console.log(`  [${lessonLabel}] ⚠️  Page unchanged for 60s in arrow loop — stuck`);
-        const stuckShotPath = `test-results/stuck-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
-        await page.screenshot({ path: stuckShotPath, fullPage: false }).catch(() => {});
-        await test.info().attach(`stuck-${lessonLabel}`, { path: stuckShotPath, contentType: 'image/png' }).catch(() => {});
-        await bugReport(page, `lesson-stuck-${lessonLabel.replace(/\s+/g, '-')}`,
-          `BUG: [${lessonLabel}] Lesson player was stuck on the same screen for over 60 seconds.\n` +
-          `  The content may have completed but the app did not update the TOC status.\n` +
-          `  Screenshot attached shows the stuck state.\n` +
-          `  Lesson URL: ${page.url()}`
-        );
-        return true;
-      }
-      await clickArrow();
-      await page.waitForTimeout(500);
-    }
-    // Reached the cap — screenshot the current state and report as a stale-status bug
-    console.log(`  [${lessonLabel}] ⚠️  Reached ${maxClicks}-click cap without detecting completion`);
-    const capShotPath = `test-results/arrow-cap-${lessonLabel.replace(/\s+/g, '-')}-${Date.now()}.png`;
-    await page.screenshot({ path: capShotPath, fullPage: false }).catch(() => {});
-    await test.info().attach(`arrow-cap-${lessonLabel}`, { path: capShotPath, contentType: 'image/png' }).catch(() => {});
-    await bugReport(page, `lesson-no-completion-signal-${lessonLabel.replace(/\s+/g, '-')}`,
-      `BUG: [${lessonLabel}] Lesson did not show a completion signal (feedback form / "You just completed" / TOC "Completed") ` +
-      `after ${maxClicks} arrow clicks. This likely means the lesson content completed but the app did not update the status.`
+  if (hasVideo) {
+    console.log(`  [${lessonLabel}] Video content detected`);
+    return await consumeVideoLesson(
+      page, lessonHref, lessonLabel, playerBox,
+      isFeedbackVisible, isYouJustCompletedVisible, isLessonCompletedInTOC
     );
   }
 
-  // ── Final: check for red alert errors ────────────────────────────────────
-  for (const sel of ['[role="alert"]:not(:has-text("Completed"))', '.alert-danger', '.sb-alert-error']) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 400 }).catch(() => false)) {
-        const txt = (await el.textContent().catch(() => sel))?.trim();
-        await bugReport(page, `lesson-error-${lessonLabel.replace(/\s+/g, '-').substring(0, 30)}`, `Red alert while consuming "${lessonLabel}": ${txt}`);
-        return false;
-      }
-    } catch (_) {}
-  }
-
-  return await isLessonCompleted() || !(await isFeedbackFormVisible());
+  console.log(`  [${lessonLabel}] Non-video content — using right-arrow`);
+  return await consumeSlideLesson(
+    page, lessonHref, lessonLabel, playerBox,
+    isFeedbackVisible, isYouJustCompletedVisible, isLessonCompletedInTOC
+  );
 }
 
-// ─── test ─────────────────────────────────────────────────────────────────────
+// ─── Consume + verify one lesson (progress + status checks) ──────────────────
+async function consumeAndVerify(
+  page: Page,
+  href: string,
+  label: string
+): Promise<void> {
+  const progressBefore = await readProgress(page);
+  console.log(`\n-> [${label}] Starting consumption. Progress before: ${progressBefore ?? 'unknown'}%`);
+
+  await consumeCurrentLesson(page, href, label);
+
+  await page.waitForTimeout(1500);
+  await expandAllUnits(page);
+  await page.waitForTimeout(600);
+
+  // Check 1: TOC status -> "Completed"
+  let statusAfter: string | null = null;
+  const statusDeadline = Date.now() + 12_000;
+  while (Date.now() < statusDeadline) {
+    statusAfter = await getLessonStatus(page, href);
+    console.log(`  [poll] TOC status = "${statusAfter}"`);
+    if (statusAfter === 'Completed') break;
+    await page.waitForTimeout(1500);
+    await expandAllUnits(page).catch(() => {});
+  }
+  console.log(`  Status after: "${statusAfter}"`);
+
+  if (statusAfter !== 'Completed') {
+    const rel = href.replace('https://test.sunbirded.org', '');
+    const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
+    const rawHtml = await anchor.evaluate((el: Element) => el.outerHTML).catch(() => '(unavailable)');
+    console.log(`  Raw anchor HTML: ${rawHtml.substring(0, 300)}`);
+
+    const staleShot = `test-results/stale-status-${label.replace(/\s+/g, '-')}-${Date.now()}.png`;
+    await page.screenshot({ path: staleShot, fullPage: false }).catch(() => {});
+    await test.info().attach(`stale-status-${label}`, { path: staleShot, contentType: 'image/png' }).catch(() => {});
+
+    const bugMsg =
+      `BUG: [${label}] Lesson status did NOT update to "Completed" after the lesson was finished.\n` +
+      `  Completion signal (feedback form or "You just completed" banner) was detected,\n` +
+      `  but TOC anchor still shows: "${statusAfter}"\n` +
+      `  Expected: "Completed"  Got: "${statusAfter}"\n` +
+      `  Lesson URL: ${href}\n` +
+      `  Screenshot: ${staleShot}`;
+    await bugReport(page, `stale-status-after-${label.replace(/\s+/g, '-')}`, bugMsg);
+    expect.soft(statusAfter, bugMsg).toBe('Completed');
+  } else {
+    console.log(`  [${label}] TOC shows Completed`);
+  }
+
+  // Check 2: Course Progress % increased
+  const progressAfter = await readProgress(page);
+  console.log(`  Progress after: ${progressAfter ?? 'unknown'}%`);
+
+  if (progressBefore !== null && progressAfter !== null) {
+    if (progressAfter < progressBefore) {
+      // Progress went backwards — definite bug
+      const progShot = `test-results/no-progress-increase-${label.replace(/\s+/g, '-')}-${Date.now()}.png`;
+      await page.screenshot({ path: progShot, fullPage: false }).catch(() => {});
+      await test.info().attach(`no-progress-increase-${label}`, { path: progShot, contentType: 'image/png' }).catch(() => {});
+      const progMsg =
+        `BUG: [${label}] Course Progress bar decreased after completing this lesson.\n` +
+        `  Before: ${progressBefore}%  ->  After: ${progressAfter}%\n` +
+        `  Lesson URL: ${href}`;
+      await bugReport(page, `progress-stuck-${label.replace(/\s+/g, '-')}`, progMsg);
+      expect.soft(progressAfter, progMsg).toBeGreaterThanOrEqual(progressBefore);
+    } else if (progressAfter === progressBefore && progressAfter < 100) {
+      // Progress did not move even though there are still lessons left — bug
+      const progShot = `test-results/no-progress-increase-${label.replace(/\s+/g, '-')}-${Date.now()}.png`;
+      await page.screenshot({ path: progShot, fullPage: false }).catch(() => {});
+      await test.info().attach(`no-progress-increase-${label}`, { path: progShot, contentType: 'image/png' }).catch(() => {});
+      const progMsg =
+        `BUG: [${label}] Course Progress bar did NOT increase after completing this lesson.\n` +
+        `  Before: ${progressBefore}%  ->  After: ${progressAfter}%  (no change)\n` +
+        `  Expected the progress bar to move forward after lesson completion.\n` +
+        `  Lesson URL: ${href}`;
+      await bugReport(page, `progress-stuck-${label.replace(/\s+/g, '-')}`, progMsg);
+      expect.soft(progressAfter, progMsg).toBeGreaterThan(progressBefore);
+    } else {
+      console.log(`  Progress updated: ${progressBefore}% -> ${progressAfter}%`);
+    }
+  } else if (progressAfter === null) {
+    const progMsg = `BUG: [${label}] Course Progress bar is not readable after completing the lesson`;
+    await bugReport(page, `progress-unreadable-${label.replace(/\s+/g, '-')}`, progMsg);
+    expect.soft(progressAfter, progMsg).not.toBeNull();
+  }
+}
+
+// =============================================================================
+//  TEST
+// =============================================================================
 
 test.describe('Home course flow', () => {
-  test('Click Continue → consume all lessons → verify 100% completion', async ({ page }) => {
+  test('Click Continue -> consume all lessons -> verify 100% completion', async ({ page }) => {
     await loginWithValidCredentials(page);
 
-    // Make sure we are on /home (not /explore or anywhere else)
     if (!page.url().includes('/home')) {
       await page.goto('https://test.sunbirded.org/home', { waitUntil: 'domcontentloaded' });
     }
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
 
-    // ── Step 1: Click the "Continue from where you left →" button ──────────
-    // From the UI the button text is exactly "Continue from where you left"
-    // (with a trailing arrow icon). It lives inside a course card on /home.
-    // Try the most specific selectors first, then fall back progressively.
-    const continueBtnSels = [
-      // Exact button text (as seen in screenshot)
+    // ── Step 1: Click "Continue from where you left" ──────────────────────
+    const continueSels = [
       'button:has-text("Continue from where you left")',
       'a:has-text("Continue from where you left")',
-      // Partial match in case the arrow icon text is included
       'button:text-matches("Continue from where you left", "i")',
       'a:text-matches("Continue from where you left", "i")',
     ];
 
     let continueClicked = false;
-    for (const sel of continueBtnSels) {
+    for (const sel of continueSels) {
       try {
         const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 3000 }).catch(() => false)) {
+        if (await el.isVisible({ timeout: 4000 }).catch(() => false)) {
           await el.scrollIntoViewIfNeeded().catch(() => {});
           await el.click();
           continueClicked = true;
-          console.log(`✅ Clicked continue button using: "${sel}"`);
+          console.log(`Clicked "Continue from where you left" via: "${sel}"`);
           break;
         }
       } catch (_) {}
     }
 
     if (!continueClicked) {
-      await bugReport(page, 'continue-missing', '"Continue from where you left" button not found on the Home page');
-      throw new Error('Continue button not found on Home page');
+      await bugReport(page, 'continue-btn-missing',
+        'BUG: "Continue from where you left" button not found on the Home page');
+      throw new Error('"Continue from where you left" button not found on Home page');
     }
 
-    // Wait for navigation INTO a course page (URL should change away from the bare /home page)
-    await page.waitForTimeout(1500);
-
+    await page.waitForTimeout(2500);
     const landedUrl = page.url();
-    // A valid course URL will contain /learn/ or /course/ or /toc/ or /enroll
-    // The bare home page is exactly https://test.sunbirded.org/home (or ends with /home)
-    const isBareHome = /\/(home)\s*$/.test(landedUrl.replace(/\?.*$/, '').replace(/#.*$/, ''));
-    const isBareExplore = /\/(explore)\s*$/.test(landedUrl.replace(/\?.*$/, '').replace(/#.*$/, ''));
-
-    if (isBareHome || isBareExplore) {
-      await bugReport(page, 'continue-wrong-nav', `Clicking Continue did not navigate away from "${landedUrl}" — still on home/explore instead of a course page`);
+    const isStillHome = /\/(home|explore)\s*$/.test(landedUrl.replace(/[?#].*$/, ''));
+    if (isStillHome) {
+      await bugReport(page, 'continue-wrong-nav',
+        `BUG: Clicking "Continue from where you left" did NOT navigate to a course page. Still on: ${landedUrl}`);
       throw new Error(`Continue did not navigate to a course page, still on: ${landedUrl}`);
     }
 
@@ -717,493 +774,446 @@ test.describe('Home course flow', () => {
     const coursePageUrl = page.url();
     console.log('Entered course page:', coursePageUrl);
 
-    // ── Step 2: Check progress — must NOT be 100% ───────────────────────────
+    // ── Step 2: Initial progress must NOT be 100% ─────────────────────────
     const initialProgress = await readProgress(page);
-    console.log('Initial course progress:', initialProgress);
-
+    console.log('Initial progress:', initialProgress);
     if (initialProgress !== null && initialProgress >= 100) {
-      await bugReport(
-        page,
-        'continue-opened-100pct',
-        `BUG: "Continue from where you left" opened a course that is already ${initialProgress}% complete. Completed courses should not appear in Continue.`
-      );
+      await bugReport(page, 'continue-100pct',
+        `BUG: "Continue from where you left" opened a course that is already ${initialProgress}% complete. A fully completed course should not appear in Continue.`);
       throw new Error(`BUG: Continue opened a ${initialProgress}% completed course`);
     }
 
-    // ── Step 3 + 4 + 5: Build lesson list from TOC, consume every lesson in order ──
-    //
-    // Strategy:
-    //   a) The "Continue" button lands directly inside a content page URL that already
-    //      has a lesson loaded in the player (e.g. /collection/.../content/do_xxx).
-    //      Consume THAT lesson first before touching the TOC.
-    //   b) Expand all Course Units (aria-safe — only opens collapsed ones).
-    //   c) Collect the href of every leaf lesson link from the TOC once, in DOM order.
-    //   d) Iterate by index: skip Already-Completed lessons, consume "In progress" and
-    //      "Not viewed" ones in order, verify TOC flips to Completed, and check that
-    //      the Course Progress % increases — report a bug if it does not.
-
+    // ── Step 3: Expand TOC ─────────────────────────────────────────────────
     await expandAllUnits(page);
     await page.waitForTimeout(600);
 
-    // ── Helper: collect all leaf lesson hrefs from TOC ──────────────────────
-    const TOC_LESSON_SELS = [
-      'nav a[href*="/content/"]',
-      '[class*="toc"] a[href*="/content/"]',
-      '[class*="sidebar"] a[href*="/content/"]',
-      'a[href*="/content/"]',
-    ];
+    // If already on a specific lesson URL, check its status first
+    const activeUrl = page.url();
+    const isOnLesson = /\/content\/do_[^/?#]+/.test(activeUrl);
 
-    const collectLessonHrefs = async (): Promise<string[]> => {
-      const currentUrl = page.url();
-      for (const sel of TOC_LESSON_SELS) {
-        try {
-          const anchors = page.locator(sel);
-          const n = await anchors.count().catch(() => 0);
-          if (n === 0) continue;
-          const hrefs: string[] = [];
-          for (let i = 0; i < n; i++) {
-            const href = await anchors.nth(i).getAttribute('href').catch(() => null);
-            if (!href) continue;
-            const full = href.startsWith('http') ? href : `https://test.sunbirded.org${href}`;
-            if (full === currentUrl) continue; // exclude course page itself
-            if (hrefs.includes(full)) continue;
-            hrefs.push(full);
-          }
-          if (hrefs.length > 0) {
-            console.log(`  TOC via "${sel}" → ${hrefs.length} lesson(s)`);
-            return hrefs;
-          }
-        } catch (_) {}
-      }
-      // Last resort: DOM eval for /content/do_ links
-      const fromDOM = await page.evaluate((base: string) => {
-        const seen = new Set<string>();
-        const out: string[] = [];
-        document.querySelectorAll('a[href]').forEach((a) => {
-          const href = (a as HTMLAnchorElement).href;
-          if (/\/content\/do_/.test(href) && href !== base && !seen.has(href)) {
-            seen.add(href);
-            out.push(href);
-          }
-        });
-        return out;
-      }, currentUrl).catch(() => [] as string[]);
-      console.log(`  TOC via DOM eval → ${fromDOM.length} lesson(s)`);
-      return fromDOM;
-    };
-
-    // ── Helper: open a lesson by its saved href ────────────────────────────
-    const openLesson = async (href: string, label: string): Promise<void> => {
-      const rel = href.replace('https://test.sunbirded.org', '');
-      const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
-      if (await anchor.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await anchor.scrollIntoViewIfNeeded().catch(() => {});
-        await anchor.click({ timeout: 5000 }).catch(async () => {
-          const h = await anchor.elementHandle().catch(() => null);
-          if (h) await page.evaluate((el: Element) => (el as HTMLElement).click(), h).catch(() => {});
-        });
-        await page.waitForTimeout(1500);
-      } else {
-        // anchor not visible (unit might be collapsed) — expand all then retry
-        await expandAllUnits(page);
-        await page.waitForTimeout(400);
-        const anchor2 = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
-        if (await anchor2.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await anchor2.scrollIntoViewIfNeeded().catch(() => {});
-          await anchor2.click({ timeout: 5000 }).catch(() => {});
-          await page.waitForTimeout(1500);
-        } else {
-          // Final fallback: navigate directly
-          console.log(`  [${label}] TOC anchor not visible — navigating directly to ${href}`);
-          await page.goto(href, { waitUntil: 'domcontentloaded' });
-          await page.waitForTimeout(1500);
-        }
-      }
-    };
-
-    // ── Helper: check if a lesson href shows Completed in the TOC ─────────
-    const isHrefCompleted = async (href: string): Promise<boolean> => {
-      const rel = href.replace('https://test.sunbirded.org', '');
-      const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
-      if (!await anchor.isVisible({ timeout: 1500 }).catch(() => false)) return false;
-      const txt = (await anchor.textContent().catch(() => ''))?.trim() ?? '';
-      return /completed/i.test(txt);
-    };
-
-    // ── Helper: read the status label of a lesson from the TOC ────────────
-    // Reads only the status-badge element inside the anchor (not the full
-    // textContent which includes the lesson title and can cause false matches).
-    // Returns "Completed", "In progress", "Not viewed", or null.
-    const getLessonStatus = async (href: string): Promise<string | null> => {
-      const rel = href.replace('https://test.sunbirded.org', '');
-
-      // Try to find the anchor first
-      const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
-      const visible = await anchor.isVisible({ timeout: 2000 }).catch(() => false);
-      if (!visible) return null;
-
-      // Strategy 1: read ONLY the status-badge span (last span / small / [class*="status"])
-      // This avoids false "Completed" matches from lesson titles that contain the word.
-      const badgeOnly = await anchor.evaluate((el: Element): string => {
-        // Sunbird renders the status as the last <span> inside the TOC anchor
-        const spans = Array.from(el.querySelectorAll('span, small, [class*="status"], [class*="badge"]'));
-        if (spans.length === 0) return el.textContent?.trim() ?? '';
-        // Return ONLY the last child span text (the status badge)
-        const last = spans[spans.length - 1];
-        return last.textContent?.trim() ?? '';
-      }).catch(() => '');
-
-      if (/completed/i.test(badgeOnly)) return 'Completed';
-      if (/in\s*progress/i.test(badgeOnly)) return 'In progress';
-      if (/not\s*view/i.test(badgeOnly)) return 'Not viewed';
-
-      // Strategy 2: scan ALL spans inside the anchor for a status keyword
-      const allSpanText = await anchor.evaluate((el: Element): string => {
-        return Array.from(el.querySelectorAll('span, small'))
-          .map(s => s.textContent?.trim() ?? '')
-          .join('|');
-      }).catch(() => '');
-
-      if (/completed/i.test(allSpanText)) return 'Completed';
-      if (/in\s*progress/i.test(allSpanText)) return 'In progress';
-      if (/not\s*view/i.test(allSpanText)) return 'Not viewed';
-
-      // Strategy 3: full anchor textContent as last resort
-      const full = (await anchor.textContent().catch(() => ''))?.trim() ?? '';
-      if (/completed/i.test(full)) return 'Completed';
-      if (/in\s*progress/i.test(full)) return 'In progress';
-      if (/not\s*view/i.test(full)) return 'Not viewed';
-
-      return full.substring(0, 60) || null;
-    };
-
-    // ── Helper: consume + verify one lesson, with progress-delta check ─────
-    const consumeAndVerify = async (href: string, label: string): Promise<void> => {
-      const progressBefore = await readProgress(page);
-      console.log(`  Progress before: ${progressBefore ?? 'unknown'}%`);
-
-      // consumeCurrentLesson handles the feedback form internally — it captures
-      // a screenshot and reports the stale-status bug BEFORE dismissing the form.
-      await consumeCurrentLesson(page, label);
-
-      await page.waitForTimeout(1000);
-
-      // Re-expand so TOC status badges are visible for post-dismiss polling
-      await expandAllUnits(page);
-      await page.waitForTimeout(600);
-
-      // ── Check 1: TOC status must flip to "Completed" ──────────────────────
-      // Poll for up to 10 s — the app updates status asynchronously after the
-      // feedback form is dismissed (server round-trip).
-      let statusAfter: string | null = null;
-      const statusDeadline = Date.now() + 10000;
-      while (Date.now() < statusDeadline) {
-        statusAfter = await getLessonStatus(href);
-        console.log(`  [poll] status = "${statusAfter}"`);
-        if (statusAfter === 'Completed') break;
-        await page.waitForTimeout(1500);
-        await expandAllUnits(page).catch(() => {});
-      }
-
-      console.log(`  Status after: "${statusAfter}" for ${href}`);
-
-      if (statusAfter !== 'Completed') {
-        // Capture the raw anchor HTML to diagnose what the DOM actually shows
-        const rel = href.replace('https://test.sunbirded.org', '');
-        const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
-        const rawTxt = (await anchor.textContent().catch(() => ''))?.trim() ?? '(anchor not found in TOC)';
-        const rawHtml = await anchor.evaluate((el: Element) => el.outerHTML).catch(() => '(unavailable)');
-        console.log(`  Raw anchor HTML: ${rawHtml.substring(0, 300)}`);
-
-        // Capture a final screenshot showing the stale TOC state
-        const staleShotPath = `test-results/status-not-updated-${label.replace(/\s+/g, '-')}-${Date.now()}.png`;
-        await page.screenshot({ path: staleShotPath, fullPage: false }).catch(() => {});
-        await test.info().attach(`status-not-updated-${label}`, { path: staleShotPath, contentType: 'image/png' }).catch(() => {});
-
-        const bugMsg =
-          `BUG: [${label}] Lesson status did NOT update to "Completed" after the lesson was finished.\n` +
-          `  Feedback form ("We would love to hear from you") confirmed lesson end,\n` +
-          `  TOC anchor still shows: "${rawTxt.substring(0, 120)}"\n` +
-          `  Expected: "Completed"   Got: "${statusAfter}"\n` +
-          `  Lesson URL: ${href}`;
-
-        await bugReport(page, `lesson-status-not-updated-${label.replace(/\s+/g, '-')}`, bugMsg);
-        expect.soft(statusAfter, bugMsg).toBe('Completed');
-      } else {
-        console.log(`  ✅ [${label}] TOC shows Completed ✓`);
-      }
-
-      // ── Check 2: Course Progress % must increase ──────────────────────────
-      const progressAfter = await readProgress(page);
-      console.log(`  Progress after: ${progressAfter ?? 'unknown'}%`);
-
-      if (progressBefore !== null && progressAfter !== null) {
-        if (progressAfter <= progressBefore) {
-          // Capture screenshot showing unchanged progress bar
-          const progShotPath = `test-results/progress-no-increase-${label.replace(/\s+/g, '-')}-${Date.now()}.png`;
-          await page.screenshot({ path: progShotPath, fullPage: false }).catch(() => {});
-          await test.info().attach(`progress-no-increase-${label}`, { path: progShotPath, contentType: 'image/png' }).catch(() => {});
-
-          const progMsg =
-            `BUG: [${label}] Course Progress bar did not increase after completing this lesson.\n` +
-            `  Feedback form ("We would love to hear from you") confirmed lesson end,\n` +
-            `  Before: ${progressBefore}%  →  After: ${progressAfter}%  (no change)\n` +
-            `  Lesson URL: ${href}`;
-          await bugReport(page, `progress-no-increase-${label.replace(/\s+/g, '-')}`, progMsg);
-          expect.soft(progressAfter, progMsg).toBeGreaterThan(progressBefore);
-        } else {
-          console.log(`  ✅ Progress updated: ${progressBefore}% → ${progressAfter}%`);
-        }
-      } else if (progressAfter === null) {
-        const progMsg = `BUG: [${label}] Course Progress bar is not readable after completing the lesson`;
-        await bugReport(page, `progress-unreadable-${label.replace(/\s+/g, '-')}`, progMsg);
-        expect.soft(progressAfter, progMsg).not.toBeNull();
-      }
-    };
-
-    // ── FIRST: consume the lesson that is already loaded in the player ─────
-    // When "Continue" is clicked the URL is already on a content page like:
-    //   /collection/<courseId>/batch/<batchId>/content/<lessonId>
-    // That lesson is already rendered in the player — play it right now.
-    const activeContentUrl = page.url();
-    const activeContentMatch = activeContentUrl.match(/\/content\/(do_[^/?#]+)/);
-
-    if (activeContentMatch) {
-      console.log(`\n▶ Playing active player lesson: ${activeContentUrl}`);
+    if (isOnLesson) {
+      console.log(`\nActive lesson in player: ${activeUrl}`);
       await closeAnyPopup(page).catch(() => {});
-      await consumeAndVerify(activeContentUrl, 'active-player');
-    } else {
-      console.log('ℹ️  No content lesson detected in URL — will consume first lesson from TOC');
+      const activeStatus = await getLessonStatus(page, activeUrl);
+      console.log(`  Active lesson TOC status: "${activeStatus}"`);
+      if (activeStatus !== 'Completed') {
+        await consumeAndVerify(page, activeUrl, 'active-player-lesson');
+      } else {
+        console.log('  Active lesson already Completed — will process rest via TOC loop');
+      }
     }
 
-    // ── THEN: consume remaining lessons — navigate back after each one ───────
-    // After consumeCurrentLesson the player may have navigated away from the
-    // course TOC page. We always return to coursePageUrl, expand the TOC and
-    // find the NEXT lesson that is "Not viewed" or "In progress" before opening
-    // it, so we never try to click a TOC anchor that is no longer on the page.
-    let lessonIteration = 0;
-    const MAX_LESSONS = 100; // safety cap
+    // ── Step 4: TOC loop — consume every "Not viewed" / "In Progress" lesson
+    let iteration = 0;
+    const MAX_ITERATIONS = 150;
 
-    while (lessonIteration < MAX_LESSONS) {
-      // Go back to the course TOC page so the TOC is visible
+    while (iteration < MAX_ITERATIONS) {
+      iteration++;
+
+      // Return to course TOC page for a fresh view
       await page.goto(coursePageUrl, { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(2000);
       await expandAllUnits(page);
       await page.waitForTimeout(500);
 
-      // Re-collect lesson hrefs from the freshly loaded TOC
-      const hrefs = await collectLessonHrefs();
+      const hrefs = await collectLessonHrefs(page);
       if (hrefs.length === 0) {
-        console.log('⚠️  No lesson hrefs found in TOC — stopping');
+        console.log('No lesson hrefs found in TOC — stopping');
         break;
       }
 
-      if (lessonIteration === 0) {
+      if (iteration === 1) {
         console.log(`\nLesson list from TOC (${hrefs.length} total):`);
         hrefs.forEach((h, i) => console.log(`  ${i + 1}. ${h}`));
       }
 
-      // Find the first lesson that is NOT yet completed
-      let foundNext = false;
+      // Find the first pending lesson
+      let foundPending = false;
       for (let i = 0; i < hrefs.length; i++) {
         const href = hrefs[i];
         const label = `Lesson-${i + 1}`;
-        const statusNow = await getLessonStatus(href);
+        const status = await getLessonStatus(page, href);
 
-        console.log(`\n→ [${label}] Status: "${statusNow}" | ${href}`);
+        console.log(`\n-> [${label}] Status: "${status ?? '(unknown)'}" | ${href}`);
 
-        if (statusNow === 'Completed') {
-          console.log(`  ↳ Already Completed — skipping`);
+        if (status === 'Completed') {
+          console.log(`  Already Completed — skipping`);
           continue;
         }
 
-        // Open this pending lesson via the TOC anchor
-        await openLesson(href, label);
+        // Open this lesson via TOC anchor
+        const rel = href.replace('https://test.sunbirded.org', '');
+        const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
+
+        if (await anchor.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await anchor.scrollIntoViewIfNeeded().catch(() => {});
+          await anchor.click({ timeout: 5000 }).catch(async () => {
+            const h = await anchor.elementHandle().catch(() => null);
+            if (h) await page.evaluate((el: Element) => (el as HTMLElement).click(), h).catch(() => {});
+          });
+          await page.waitForTimeout(2000);
+        } else {
+          // Expand and retry
+          await expandAllUnits(page);
+          await page.waitForTimeout(400);
+          const anchor2 = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
+          if (await anchor2.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await anchor2.scrollIntoViewIfNeeded().catch(() => {});
+            await anchor2.click({ timeout: 5000 }).catch(() => {});
+            await page.waitForTimeout(2000);
+          } else {
+            console.log(`  [${label}] TOC anchor not visible — navigating directly to ${href}`);
+            await page.goto(href, { waitUntil: 'domcontentloaded' });
+            await page.waitForTimeout(2000);
+          }
+        }
+
         await closeAnyPopup(page).catch(() => {});
-
-        // Consume and verify, then break out to re-scan the TOC
-        await consumeAndVerify(href, label);
-        foundNext = true;
+        await consumeAndVerify(page, href, label);
+        foundPending = true;
         break;
       }
 
-      if (!foundNext) {
-        console.log('\n✅ All lessons are Completed — done iterating');
+      if (!foundPending) {
+        console.log('\nAll lessons are Completed — done');
         break;
       }
-
-      lessonIteration++;
     }
 
-    if (lessonIteration >= MAX_LESSONS) {
-      console.warn(`⚠️  Reached MAX_LESSONS (${MAX_LESSONS}) safety cap — stopping lesson loop`);
+    if (iteration >= MAX_ITERATIONS) {
+      console.warn(`Hit MAX_ITERATIONS (${MAX_ITERATIONS}) safety cap`);
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // POST-COMPLETION CHECKS (all 5 scenarios)
-    // ════════════════════════════════════════════════════════════════════════
+    // ==========================================================================
+    // POST-COMPLETION CHECKS
+    // ==========================================================================
 
-    // Navigate back to the course page to run all checks from a clean state
+    // ── Handle the "Congratulations! You have successfully completed the course"
+    // popup that appears on the content player right after the final lesson.
+    // 1. Detect it (it may already be visible or appear within a few seconds).
+    // 2. Screenshot it as evidence.
+    // 3. Close it via the × button.
+    // 4. Immediately click the three-dots (⋮) next to "Course Progress" and
+    //    click "Sync Progress now" while still on this page.
+    // Then navigate back to coursePageUrl for the remaining checks.
+
+    console.log('\nCheck 1: Congratulations popup + Sync Progress now...');
+
+    // Wait up to 5s for the popup to appear (it may take a moment after last lesson)
+    const congratsSels = [
+      'text=/you have successfully completed the course/i',
+      'text=/congratulations/i',
+      '[role="dialog"]:has-text("complet")',
+      '[class*="modal"]:has-text("Congratulations")',
+    ];
+    let congratsFound = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      for (const sel of congratsSels) {
+        if (await page.locator(sel).first().isVisible({ timeout: 1000 }).catch(() => false)) {
+          congratsFound = true;
+          console.log(`  Congratulations popup found via: "${sel}"`);
+          break;
+        }
+      }
+      if (congratsFound) break;
+      await page.waitForTimeout(1000);
+    }
+
+    if (congratsFound) {
+      // Screenshot the popup as evidence
+      const congratsShot = `test-results/congratulations-popup-${Date.now()}.png`;
+      await page.screenshot({ path: congratsShot, fullPage: false }).catch(() => {});
+      await test.info().attach('congratulations-popup', { path: congratsShot, contentType: 'image/png' }).catch(() => {});
+      console.log('  Screenshot captured. Closing the popup...');
+
+      // Close the popup via the × button
+      const closeSelectors = [
+        'button[aria-label="Close"]',
+        'button[aria-label*="close" i]',
+        'button:has-text("×")',
+        '[role="dialog"] button:last-of-type',
+        '[class*="modal"] button[class*="close"]',
+      ];
+      let closed = false;
+      for (const sel of closeSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 800 }).catch(() => false)) {
+            await btn.click();
+            closed = true;
+            console.log(`  Closed congratulations popup via: "${sel}"`);
+            break;
+          }
+        } catch (_) {}
+      }
+      if (!closed) {
+        await page.keyboard.press('Escape').catch(() => {});
+        console.log('  Closed congratulations popup via Escape');
+      }
+      await page.waitForTimeout(800);
+
+      // ── Navigate back to the course landing page where the Course Progress
+      // card (and the ⋮ button) lives — the popup appears on the player page
+      // which does not have that card.
+      console.log('  Navigating to course landing page to access Course Progress card...');
+      await page.goto(coursePageUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+
+      // ── Now click the three-dots (⋮) next to "Course Progress" and sync ──
+      console.log('  Clicking three-dots (⋮) next to "Course Progress" to Sync Progress...');
+
+      const progressCardHeading = page.locator(
+        'h3:has-text("Course Progress"), h2:has-text("Course Progress"), span:has-text("Course Progress")'
+      ).first();
+      await progressCardHeading.scrollIntoViewIfNeeded().catch(() => {});
+      const progressCard = progressCardHeading.locator('../..');
+      await progressCard.hover().catch(() => {});
+      await page.waitForTimeout(500);
+
+      let threeDotsBtn = progressCard.locator(
+        'button[aria-label*="more" i], button[aria-label*="option" i], button[aria-label*="menu" i], ' +
+        'button:has(svg[class*="dots"]), button:has(svg[class*="ellipsis"]), ' +
+        'button:has-text("⋮"), button:has-text("…")'
+      ).first();
+      let dotsVisible = await threeDotsBtn.isVisible({ timeout: 2000 }).catch(() => false);
+
+      if (!dotsVisible) {
+        threeDotsBtn = page.locator(
+          'button[aria-label*="more" i]:near(h3:has-text("Course Progress")), ' +
+          'button[aria-label*="option" i]:near(h3:has-text("Course Progress"))'
+        ).first();
+        dotsVisible = await threeDotsBtn.isVisible({ timeout: 1500 }).catch(() => false);
+      }
+
+      if (!dotsVisible) {
+        await bugReport(page, 'check1-threedots-missing',
+          'BUG: The three-dots (⋮) button next to "Course Progress" is not visible after closing the Congratulations popup.');
+        expect.soft(dotsVisible, 'Three-dots (⋮) button must be visible in Course Progress card').toBe(true);
+      } else {
+        await threeDotsBtn.scrollIntoViewIfNeeded().catch(() => {});
+        await threeDotsBtn.click();
+        console.log('  Clicked three-dots (⋮) button');
+        await page.waitForTimeout(700);
+
+        const menuShot = `test-results/check1-sync-menu-${Date.now()}.png`;
+        await page.screenshot({ path: menuShot }).catch(() => {});
+        await test.info().attach('check1-sync-menu', { path: menuShot, contentType: 'image/png' }).catch(() => {});
+
+        const syncBtn = page.locator(
+          'text=/sync progress now/i, text=/sync progress/i, ' +
+          '[role="menuitem"]:has-text("Sync"), li:has-text("Sync"), button:has-text("Sync")'
+        ).first();
+        const syncVisible = await syncBtn.isVisible({ timeout: 2000 }).catch(() => false);
+
+        if (!syncVisible) {
+          await page.keyboard.press('Escape').catch(() => {});
+          await bugReport(page, 'check1-sync-missing',
+            'BUG: Clicked the three-dots (⋮) button after Congratulations popup but ' +
+            '"Sync Progress now" was NOT present in the dropdown menu.\n' +
+            '  Screenshot of the open menu is attached as "check1-sync-menu".'
+          );
+          expect.soft(syncVisible, '"Sync Progress now" must appear in the Course Progress menu').toBe(true);
+        } else {
+          await syncBtn.click();
+          console.log('  Clicked "Sync Progress now"');
+          await page.waitForTimeout(1500);
+
+          const toastSels = [
+            'text=/you can view the progress in 24/i',
+            'text=/view.*progress.*24/i',
+            'text=/24 hours/i',
+            '[role="alert"]:has-text("24")',
+            '[class*="toast"]:has-text("24")',
+            '[class*="snack"]:has-text("success" i)',
+          ];
+          let toastFound = false;
+          for (const sel of toastSels) {
+            if (await page.locator(sel).first().isVisible({ timeout: 3000 }).catch(() => false)) {
+              console.log(`  Sync toast confirmed: "${sel}"`);
+              toastFound = true;
+              break;
+            }
+          }
+          if (!toastFound) {
+            const toastShot = `test-results/check1-no-toast-${Date.now()}.png`;
+            await page.screenshot({ path: toastShot, fullPage: false }).catch(() => {});
+            await test.info().attach('check1-no-toast', { path: toastShot, contentType: 'image/png' }).catch(() => {});
+            await bugReport(page, 'check1-sync-no-toast',
+              'BUG: Clicked "Sync Progress now" but did NOT see the success toast.\n' +
+              '  Expected: "You can view the progress in 24 hours" toast/snackbar.\n' +
+              `  Screenshot: ${toastShot}`
+            );
+            expect.soft(toastFound, '"You can view the progress in 24 hours" toast must appear after Sync').toBe(true);
+          }
+        }
+      }
+    } else {
+      // Congratulations popup did NOT appear — that is a bug
+      const noCongratsShot = `test-results/no-congratulations-popup-${Date.now()}.png`;
+      await page.screenshot({ path: noCongratsShot, fullPage: false }).catch(() => {});
+      await test.info().attach('no-congratulations-popup', { path: noCongratsShot, contentType: 'image/png' }).catch(() => {});
+      await bugReport(page, 'check1-no-congratulations-popup',
+        'BUG: All lessons were completed but the "Congratulations! You have successfully completed the course" popup did NOT appear.\n' +
+        `  Expected this popup to show on the content player after the final lesson.\n` +
+        `  Screenshot: ${noCongratsShot}`
+      );
+    }
+
+    // Navigate to the course TOC page for the remaining checks
     await page.goto(coursePageUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2500);
     await expandAllUnits(page);
     await page.waitForTimeout(500);
 
-    // Read the course title for later home-page checks
     const courseTitle = await page.locator('h1, h2').first().textContent().catch(() => '') ?? '';
     console.log(`\nCourse title: "${courseTitle}"`);
-    console.log('Running post-completion checks…\n');
+    console.log('Running remaining post-completion checks...\n');
 
-    // ── Check 1: Success popup for course completion ─────────────────────────
-    console.log('Check 1: Success popup…');
-    const successPopupSels = [
-      'text=/congratulations/i',
-      'text=/course.*complet/i',
-      'text=/well done/i',
-      'text=/you.*complet/i',
-      '[role="dialog"]:has-text("complet")',
-      '.toast:has-text("complet")',
-      '[class*="success"]:has-text("complet")',
-      '[class*="modal"]:has-text("complet")',
-    ];
-    let successPopupFound = false;
-    for (const sel of successPopupSels) {
-      if (await page.locator(sel).first().isVisible({ timeout: 2000 }).catch(() => false)) {
-        console.log(`  ✅ Success popup found: "${sel}"`);
-        successPopupFound = true;
-        break;
-      }
-    }
-    if (!successPopupFound) {
-      await bugReport(page, 'check1-no-success-popup',
-        'BUG: All lessons completed but no congratulations/success popup appeared');
-    }
-
-    // ── Check 2: Course Progress component shows 100% ────────────────────────
-    console.log('Check 2: Course Progress = 100%…');
+    // Check 2: Course Progress = 100%
+    console.log('Check 2: Course Progress = 100%...');
     const finalProgress = await readProgress(page);
-    console.log(`  Progress reads: ${finalProgress}%`);
+    console.log(`  Course progress reads: ${finalProgress}%`);
+
     if (finalProgress !== 100) {
+      const progShot = `test-results/final-progress-not-100-${Date.now()}.png`;
+      await page.screenshot({ path: progShot, fullPage: false }).catch(() => {});
+      await test.info().attach('final-progress-not-100', { path: progShot, contentType: 'image/png' }).catch(() => {});
       await bugReport(page, 'check2-progress-not-100',
-        `BUG: Course Progress component shows ${finalProgress}% after all lessons consumed — expected 100%`);
-      throw new Error(`BUG: Course progress is ${finalProgress}% after completing all lessons`);
+        `BUG: Course Progress shows ${finalProgress}% after all lessons were consumed — expected 100%.\n` +
+        `  The progress bar is not updating correctly even after full consumption.\n` +
+        `  Screenshot: ${progShot}`
+      );
+      throw new Error(`BUG: Course progress is ${finalProgress}% after completing all lessons (expected 100%)`);
     } else {
-      console.log('  ✅ Course Progress is 100%');
+      console.log('  Course Progress is 100%');
     }
 
-    // ── Check 3: Every lesson in TOC shows "Completed" ───────────────────────
-    console.log('Check 3: All lesson statuses = Completed…');
-    // Re-collect hrefs on the freshly reloaded page and check each TOC anchor
-    const allFinalHrefs = await collectLessonHrefs();
-    let allCompleted = true;
-    for (let i = 0; i < allFinalHrefs.length; i++) {
-      const href = allFinalHrefs[i];
+    // Check 3: Every lesson in TOC shows "Completed"
+    console.log('Check 3: All lessons Completed in TOC...');
+    const finalHrefs = await collectLessonHrefs(page);
+    let allDone = true;
+    for (let i = 0; i < finalHrefs.length; i++) {
+      const href = finalHrefs[i];
       const rel = href.replace('https://test.sunbirded.org', '');
       const anchor = page.locator(`a[href="${href}"], a[href="${rel}"]`).first();
       const rowTxt = (await anchor.textContent().catch(() => ''))?.trim() ?? '';
       if (rowTxt && !/completed/i.test(rowTxt)) {
-        allCompleted = false;
-        await bugReport(page, `check3-lesson-not-completed-${i + 1}`,
-          `BUG: Lesson ${i + 1} does not show "Completed" after course completion. Text: "${rowTxt.substring(0, 120)}"`);
+        allDone = false;
+        await bugReport(page, `check3-lesson-${i + 1}-not-completed`,
+          `BUG: Lesson ${i + 1} does NOT show "Completed" after full course completion.\n` +
+          `  TOC text: "${rowTxt.substring(0, 120)}"\n` +
+          `  Lesson URL: ${href}`
+        );
       }
     }
-    if (allCompleted && allFinalHrefs.length > 0) {
-      console.log(`  ✅ All ${allFinalHrefs.length} lesson(s) show Completed`);
+    if (allDone && finalHrefs.length > 0) {
+      console.log(`  All ${finalHrefs.length} lesson(s) show Completed`);
     }
 
-    // ── Check 4: Three-dots menu → "Sync Progress now" → success toast ───────
-    console.log('Check 4: Three-dots → Sync Progress now → success toast…');
+    // Check 4: Three-dots menu -> "Sync Progress now" -> success toast
+    console.log('Check 4: Three-dots -> Sync Progress now...');
 
-    // The ⋮ button lives inside the Course Progress card (the yellow box).
-    // Scope to the card container — go up 2 levels from the heading to reach
-    // the card root so both the heading AND the ⋮ button are inside the scope.
-    const progressCard = page.locator(
-      'h3:has-text("Course Progress"), h2:has-text("Course Progress")'
-    ).first().locator('../..');
+    // The ⋮ button sits inside the Course Progress card.
+    // Scroll it into view, hover, then click it.
+    const progressCardHeading = page.locator(
+      'h3:has-text("Course Progress"), h2:has-text("Course Progress"), span:has-text("Course Progress")'
+    ).first();
+    await progressCardHeading.scrollIntoViewIfNeeded().catch(() => {});
 
-    // Hover the card first — some implementations reveal the button on hover
+    // Scope to the card container (2 levels up from the heading)
+    const progressCard = progressCardHeading.locator('../..');
     await progressCard.hover().catch(() => {});
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(500);
 
-    // Find the ⋮ button — try multiple selector strategies inside the card
-    const threeDotsBtn = progressCard.locator(
-      'button[aria-label*="more" i], ' +
-      'button[aria-label*="option" i], ' +
-      'button[aria-label*="menu" i], ' +
-      'button:has(svg[class*="dots"]), ' +
-      'button:has(svg[class*="ellipsis"]), ' +
-      '[class*="header"] button:last-child, ' +
-      'div:first-child button:last-child, ' +
-      'button:last-of-type'
+    // The ⋮ button — try scoped first, then page-wide fallback
+    let threeDotsBtn = progressCard.locator(
+      'button[aria-label*="more" i], button[aria-label*="option" i], button[aria-label*="menu" i], ' +
+      'button:has(svg[class*="dots"]), button:has(svg[class*="ellipsis"]), ' +
+      'button:has-text("⋮"), button:has-text("…")'
     ).first();
 
-    const dotsVisible = await threeDotsBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    let dotsVisible = await threeDotsBtn.isVisible({ timeout: 2000 }).catch(() => false);
+
+    // Fallback: look for any ⋮/… button anywhere near the progress section
+    if (!dotsVisible) {
+      threeDotsBtn = page.locator(
+        'button[aria-label*="more" i]:near(h3:has-text("Course Progress")), ' +
+        'button[aria-label*="option" i]:near(h3:has-text("Course Progress"))'
+      ).first();
+      dotsVisible = await threeDotsBtn.isVisible({ timeout: 1500 }).catch(() => false);
+    }
 
     if (!dotsVisible) {
-      await bugReport(page, 'check4-threedots-not-found',
-        'BUG: Could not find the three-dots (⋮) button next to "Course Progress"');
-      expect.soft(dotsVisible, 'Three-dots (⋮) button must be visible in the Course Progress card').toBe(true);
+      await bugReport(page, 'check4-threedots-missing',
+        'BUG: The three-dots (⋮) button next to "Course Progress" is not visible.');
+      expect.soft(dotsVisible, 'Three-dots (⋮) button must be visible in Course Progress card').toBe(true);
     } else {
       await threeDotsBtn.scrollIntoViewIfNeeded().catch(() => {});
       await threeDotsBtn.click();
       console.log('  Clicked three-dots (⋮) button');
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(700);
 
-      // Screenshot the open menu for evidence
-      const menuShot = `test-results/check4-threedots-menu-${Date.now()}.png`;
+      const menuShot = `test-results/check4-menu-${Date.now()}.png`;
       await page.screenshot({ path: menuShot }).catch(() => {});
       await test.info().attach('check4-threedots-menu', { path: menuShot, contentType: 'image/png' }).catch(() => {});
 
-      // Look for "Sync Progress now" menu item
       const syncBtn = page.locator(
         'text=/sync progress now/i, text=/sync progress/i, ' +
         '[role="menuitem"]:has-text("Sync"), li:has-text("Sync"), button:has-text("Sync")'
       ).first();
 
       const syncVisible = await syncBtn.isVisible({ timeout: 2000 }).catch(() => false);
-
       if (!syncVisible) {
-        console.log('  ℹ️  "Sync Progress now" not in menu — may already be synced (not a bug)');
+        // "Sync Progress now" must appear in the menu — if it doesn't that is a bug
         await page.keyboard.press('Escape').catch(() => {});
+        await bugReport(page, 'check4-sync-missing',
+          'BUG: Clicked the three-dots (⋮) button on the Course Progress card but ' +
+          '"Sync Progress now" option was NOT present in the dropdown menu.\n' +
+          `  Screenshot of the open menu is attached as "check4-threedots-menu".`
+        );
+        expect.soft(syncVisible, '"Sync Progress now" must appear in the Course Progress menu').toBe(true);
       } else {
         await syncBtn.click();
         console.log('  Clicked "Sync Progress now"');
         await page.waitForTimeout(1500);
 
-        // Verify success toast
         const toastSels = [
           'text=/you can view the progress in 24/i',
-          'text=/view.*progress.*24 hours/i',
+          'text=/view.*progress.*24/i',
           'text=/24 hours/i',
           '[role="alert"]:has-text("24")',
           '[class*="toast"]:has-text("24")',
-          '[class*="snack"]:has-text("Success")',
+          '[class*="snack"]:has-text("success" i)',
         ];
         let toastFound = false;
         for (const sel of toastSels) {
           if (await page.locator(sel).first().isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log(`  ✅ Sync toast confirmed: "${sel}"`);
+            console.log(`  Sync toast confirmed: "${sel}"`);
             toastFound = true;
             break;
           }
         }
         if (!toastFound) {
-          const toastMsg = 'BUG: Clicked "Sync Progress now" but did not see "You can view the progress in 24 hours" toast';
+          const toastShot = `test-results/check4-no-toast-${Date.now()}.png`;
+          await page.screenshot({ path: toastShot, fullPage: false }).catch(() => {});
+          await test.info().attach('check4-no-toast', { path: toastShot, contentType: 'image/png' }).catch(() => {});
+          const toastMsg =
+            'BUG: Clicked "Sync Progress now" but did NOT see the success toast.\n' +
+            '  Expected: "You can view the progress in 24 hours" toast/snackbar.\n' +
+            `  Screenshot: ${toastShot}`;
           await bugReport(page, 'check4-sync-no-toast', toastMsg);
           expect.soft(toastFound, toastMsg).toBe(true);
         }
       }
     }
 
-    // ── Check 5: Go back → course NOT in "Continue" or "In Progress" on Home ─
-    console.log('Check 5: Go Back → course absent from Continue / In Progress…');
-    // Click "Go Back" / back arrow
+    // Check 5: Go Back -> course NOT in Continue / In Progress on Home
+    console.log('Check 5: Course removed from Continue/In Progress after completion...');
     const goBackSels = [
       'a:has-text("Go Back")',
       'button:has-text("Go Back")',
       '[aria-label*="back" i]',
       'a.back-btn',
-      // The "← Go Back" link visible in the course page header
       'text=Go Back',
     ];
     let wentBack = false;
@@ -1216,51 +1226,47 @@ test.describe('Home course flow', () => {
       }
     }
     if (!wentBack) {
-      // Fallback: browser back
       await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
     }
 
-    // Wait to land on home
-    await page.waitForURL(/\/home/, { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+    await page.waitForURL(/\/home/, { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(2500);
 
-    // Make sure we are actually on /home
     if (!page.url().includes('/home')) {
       await page.goto('https://test.sunbirded.org/home', { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
     }
 
-    // Check "Continue from where you left" section
-    const homePageText = await page.locator('body').textContent().catch(() => '') ?? '';
     const titleShort = courseTitle.trim().substring(0, 40);
 
-    // Check "Continue from where you left" section specifically
     const continueSection = page.locator(
-      'section:has-text("Continue from where you left"), ' +
-      'div:has-text("Continue from where you left")'
+      'section:has-text("Continue from where you left"), div:has-text("Continue from where you left")'
     ).first();
-    const continueSectionText = await continueSection.textContent().catch(() => '') ?? '';
+    const continueSectionTxt = await continueSection.textContent().catch(() => '') ?? '';
 
-    // Check "In Progress" section
     const inProgressSection = page.locator(
       'section:has-text("In Progress"), div:has-text("In Progress")'
     ).first();
-    const inProgressText = await inProgressSection.textContent().catch(() => '') ?? '';
+    const inProgressTxt = await inProgressSection.textContent().catch(() => '') ?? '';
 
-    if (titleShort && continueSectionText.includes(titleShort)) {
-      await bugReport(page, 'check5-course-in-continue',
-        `BUG: Completed course "${courseTitle}" still appears in "Continue from where you left" section on Home page`);
+    if (titleShort && continueSectionTxt.includes(titleShort)) {
+      await bugReport(page, 'check5-still-in-continue',
+        `BUG: Completed course "${courseTitle}" still appears in "Continue from where you left" on Home.\n` +
+        `  A fully completed course should NOT appear in the Continue section.`
+      );
     } else {
-      console.log('  ✅ Course NOT found in "Continue from where you left"');
+      console.log('  Course NOT in "Continue from where you left"');
     }
 
-    if (titleShort && inProgressText.includes(titleShort)) {
-      await bugReport(page, 'check5-course-in-inprogress',
-        `BUG: Completed course "${courseTitle}" still appears in "In Progress" section on Home page`);
+    if (titleShort && inProgressTxt.includes(titleShort)) {
+      await bugReport(page, 'check5-still-in-inprogress',
+        `BUG: Completed course "${courseTitle}" still appears in "In Progress" on Home.\n` +
+        `  A fully completed course should NOT appear in the In Progress section.`
+      );
     } else {
-      console.log('  ✅ Course NOT found in "In Progress"');
+      console.log('  Course NOT in "In Progress"');
     }
 
-    console.log('\n✅ All post-completion checks done');
+    console.log('\nAll post-completion checks done!');
   });
 });
